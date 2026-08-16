@@ -1,0 +1,72 @@
+# swingbot yapılandırması.
+#
+# Bu dosyayı `config.yaml` olarak kopyala ve kendi değerlerinle doldur.
+# `config.yaml` .gitignore'dadır — sırları BURAYA DEĞİL, .env'e yaz
+# (bkz. .env.example). Şema: SPEC.md Bölüm 8.
+
+mode: paper                      # backtest | paper | live
+
+exchange:
+  name: binance
+  quote: USDT
+  rate_limit_per_min: 1000
+
+data:
+  db_path: ./data/swingbot.db
+  timeframe: 1d
+  backfill_years: 3
+
+universe:
+  min_median_quote_volume: 5000000
+  min_listing_age_days: 180
+  max_symbols: 100
+  exclude_patterns: ["UP/", "DOWN/", "BULL/", "BEAR/", "3L/", "3S/"]
+  exclude_stablecoins: true
+
+strategy:
+  active: trendfollow
+  trendfollow:
+    sma_long: 200
+    sma_exit: 50
+    breakout_lookback: 20
+    atr_period: 14
+    atr_stop_mult: 2.5
+    max_atr_pct: 0.08
+  momentum:
+    top_n: 5
+    exit_rank: 10
+    rebalance_weekday: 1
+    weights: { mom_90: 0.4, mom_30: 0.3, vol_30: 0.2, liq: 0.1 }
+
+risk:
+  risk_per_trade: 0.01
+  max_positions: 5
+  max_exposure: 0.80
+  max_position_pct: 0.25
+  cooldown_hours: 24
+
+breaker:
+  max_drawdown: 0.15
+  max_daily_loss: 0.05
+  max_consecutive_losses: 6
+  max_order_errors_24h: 3
+
+costs:                           # İ4: zorunlu, sıfır olamaz
+  fee_rate: 0.001
+  slippage_bps: 15
+
+execution:
+  order_type: market
+  approval_ttl_hours: 4
+  run_at_utc: "00:05"
+
+telegram:
+  enabled: true
+  allowed_chat_id: 0             # .env'den override edilir
+
+web:
+  addr: "127.0.0.1:8080"         # DIŞARI AÇMA
+
+log:
+  level: info
+  file: ./data/swingbot.log
