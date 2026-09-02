@@ -10,27 +10,21 @@ import (
 	"github.com/shopspring/decimal"
 
 	"swingbot/internal/broker"
+	"swingbot/internal/config"
 	"swingbot/internal/domain"
+	"swingbot/internal/risk"
 	"swingbot/internal/strategy"
 )
 
-// RiskGate turns a raw entry Signal into an order quantity, or rejects it
-// with a human-readable reason (İ6). It is engine's placeholder for
-// internal/risk (risk-management-engineer, Ajan 9), which is not built
-// yet — Config.RiskGate defaults to SimpleRiskGate, an implementation of
-// SPEC.md Bölüm 6.5.1's sizing formula only (no gate rules like
-// max_positions/max_exposure/cooldown/breaker; those need risk.Gate).
-// Engine talks to trading exclusively through this interface so swapping
-// in the real internal/risk.Sizer+Gate later is a one-line change here,
-// not a rewrite of the day loop.
+// RiskGate turns a raw entry Signal into a sized-or-rejected Decision
+// (SPEC.md Bölüm 6.5.2). *risk.Gate (internal/risk, risk-management-
+// engineer/Ajan 9) satisfies this directly — its Evaluate method already
+// has exactly this shape — so Config.RiskGate normally just IS a
+// *risk.Gate. The interface exists only so tests can supply a lightweight
+// double (e.g. the golden buy-and-hold test's allInGate) without needing
+// a full config.RiskConfig/domain.Market to drive risk.Sizer's formula.
 type RiskGate interface {
-	// Size returns the quantity to buy for signal given the current
-	// portfolio. An empty reason means accepted; a non-empty reason means
-	// rejected (qty is meaningless) and is recorded verbatim in
-	// Result.Rejections for the same reason SPEC.md Bölüm 6.5.2 requires
-	// risk.Gate to log rejected proposals: "neden işlem yapılmadı"
-	// panelde görünür olmalı.
-	Size(signal domain.Signal, portfolio domain.Portfolio) (qty decimal.Decimal, reason string)
+	Evaluate(signal domain.Signal, in risk.GateInput) risk.Decision
 }
 
 // Config configures a single Run.
@@ -48,12 +42,25 @@ type Config struct {
 	// callers either pass a fixed Universe or accept the "every symbol
 	// with enough history today" default.
 	Universe []string
+	// Markets supplies each symbol's exchange filters (StepSize,
+	// MinNotional) to RiskGate's sizing step. A symbol missing from this
+	// map sizes against a zero-value domain.Market — risk.Sizer treats a
+	// zero StepSize as "no rounding" and a zero MinNotional as "no floor",
+	// so an incomplete map degrades gracefully rather than erroring.
+	Markets map[string]domain.Market
 
 	InitialCash float64
 	Costs       broker.Costs
-	// RiskGate defaults to NewSimpleRiskGate(DefaultRiskConfig(), nil) if
-	// nil.
+	// RiskGate defaults to risk.NewGate(config.RiskConfig{}, risk.NewSizer(config.RiskConfig{}))
+	// if nil — i.e. SPEC.md Bölüm 8's documented defaults (risk.Gate/Sizer
+	// fall back to those for any zero config field).
 	RiskGate RiskGate
+	// Breaker, if set, is checked once per day (after that day's fills,
+	// before evaluating signals) and fed every closed trade, so a
+	// backtest can trip and block new entries exactly like paper/live
+	// would (SPEC.md Bölüm 6.5.3). Optional: nil means the breaker is
+	// always considered closed.
+	Breaker *risk.Breaker
 
 	Mode string // "backtest" (default) — kept for ClosedTrade/Position.Strategy stamping parity with paper/live
 }
@@ -130,7 +137,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	riskGate := cfg.RiskGate
 	if riskGate == nil {
-		riskGate = NewSimpleRiskGate(DefaultRiskConfig(), nil)
+		riskGate = risk.NewGate(config.RiskConfig{}, risk.NewSizer(config.RiskConfig{}))
 	}
 
 	calendar := buildCalendar(cfg.Candles)
@@ -167,6 +174,9 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		}
 	}
 
+	lastExitAt := make(map[string]time.Time)
+	tradesSeen := 0
+
 	for i := warmup + 1; i < len(calendar); i++ {
 		t := calendar[i]
 		if err := pb.Advance(ctx, t); err != nil {
@@ -180,6 +190,27 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		res.Equity = append(res.Equity, EquityPoint{
 			Date: t, Equity: portfolio.Equity, Cash: portfolio.Cash, Exposure: portfolio.Exposure(),
 		})
+
+		// Feed every trade that closed as of today (signal exits AND
+		// gap-rule stop-outs both land in pb.ClosedTrades()) into the
+		// breaker and the per-symbol cooldown clock, BEFORE today's
+		// entries are evaluated against either — SPEC.md Bölüm 6.5.2's
+		// cooldown rule and Bölüm 6.5.3's breaker must see today's exits.
+		// ClosedTradesSince (not ClosedTrades) so this daily poll copies
+		// only today's new trades, not the whole ever-growing history.
+		newTrades := pb.ClosedTradesSince(tradesSeen)
+		for _, tr := range newTrades {
+			lastExitAt[tr.Symbol] = tr.ExitTime
+			if cfg.Breaker != nil {
+				cfg.Breaker.RecordTrade(risk.TradeResult{ClosedAt: tr.ExitTime, PnL: tr.PnLQuote})
+			}
+		}
+		tradesSeen += len(newTrades)
+
+		breakerOpen := false
+		if cfg.Breaker != nil {
+			breakerOpen = cfg.Breaker.Check(portfolio.Equity, t).Open
+		}
 
 		series, universe := buildSeriesAndUniverse(cfg.Candles, dateIndex, cfg.Universe, t, warmup)
 		if len(universe) == 0 {
@@ -209,12 +240,15 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		}
 
 		for _, s := range entries {
-			qty, reason := riskGate.Size(s, portfolio)
-			if reason != "" {
-				res.Rejections = append(res.Rejections, Rejection{AsOf: t, Symbol: s.Symbol, Reason: reason})
+			decision := riskGate.Evaluate(s, risk.GateInput{
+				Portfolio: portfolio, Market: cfg.Markets[s.Symbol], Now: t,
+				LastExitAt: lastExitAt[s.Symbol], BreakerOpen: breakerOpen,
+			})
+			if !decision.Approved {
+				res.Rejections = append(res.Rejections, Rejection{AsOf: t, Symbol: s.Symbol, Reason: decision.Reason})
 				continue
 			}
-			if err := submitEntry(ctx, pb, s, qty); err != nil {
+			if err := submitEntry(ctx, pb, s, decision.Size.Qty); err != nil {
 				res.Warnings = append(res.Warnings, fmt.Sprintf("%s %s: %v", t.Format("2006-01-02"), s.Symbol, err))
 			}
 		}

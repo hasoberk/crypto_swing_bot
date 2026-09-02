@@ -228,8 +228,16 @@ func (b *PaperBroker) fillPending(t time.Time) map[string]bool {
 
 		case domain.SideSell:
 			fillPrice := c.Open * (1 - b.costs.SlippageBps/10000)
-			b.settleExit(po.req.Symbol, po.req.Qty, fillPrice, t, "signal")
-			b.markFilled(po.req.ClientOrderID, po.req.Qty, fillPrice, b.lastExitFee)
+			if b.settleExit(po.req.Symbol, fillPrice, t, "signal") {
+				b.markFilled(po.req.ClientOrderID, po.req.Qty, fillPrice, b.lastExitFee)
+			} else {
+				// The position this exit targeted is already gone — e.g. a
+				// gap-rule stop closed it on an earlier day while this
+				// order sat pending through a data gap. Recording it
+				// FILLED would fabricate a trade that moved no cash;
+				// CANCELED is honest about what actually happened.
+				b.markCanceled(po.req.ClientOrderID)
+			}
 		}
 	}
 	b.pending = remaining
@@ -291,7 +299,7 @@ func (b *PaperBroker) checkStops(t time.Time, justOpenedToday map[string]bool) {
 			gapFill = pos.StopPrice
 		}
 		fillPrice := gapFill * (1 - b.costs.SlippageBps/10000)
-		b.settleExit(sym, pos.Qty, fillPrice, t, "stop")
+		b.settleExit(sym, fillPrice, t, "stop") // checkStops just confirmed sym is open, above
 	}
 }
 
@@ -301,12 +309,21 @@ func (b *PaperBroker) checkStops(t time.Time, justOpenedToday map[string]bool) {
 // Order without settleExit needing to also thread an Order through. reason
 // is "signal" (explicit exit order) or "stop" (gap-rule trigger detected
 // by checkStops).
-func (b *PaperBroker) settleExit(symbol string, qty decimal.Decimal, fillPrice float64, t time.Time, reason string) {
+//
+// settleExit always closes the FULL position — it takes no qty parameter
+// on purpose. PaperBroker (and everything that submits to it) never does
+// partial exits (SPEC.md Bölüm 6.6.2's "kısmi dolumları destekle" is a
+// LiveBroker-only requirement), so trusting a caller-supplied qty here
+// would only ever be a way for a caller bug to silently under/over-close
+// a position; using pos.Qty directly makes that class of bug impossible.
+// ok is false (a no-op, no cash/trade side effects) if symbol has no open
+// position — callers must check ok before treating the exit as filled.
+func (b *PaperBroker) settleExit(symbol string, fillPrice float64, t time.Time, reason string) bool {
 	pos, ok := b.positions[symbol]
 	if !ok {
-		return
+		return false
 	}
-	qtyF, _ := qty.Float64()
+	qtyF, _ := pos.Qty.Float64()
 
 	proceeds := fillPrice * qtyF
 	fee := proceeds * b.costs.FeeRate
@@ -327,13 +344,14 @@ func (b *PaperBroker) settleExit(symbol string, qty decimal.Decimal, fillPrice f
 		EntryPrice: pos.EntryPrice,
 		ExitTime:   t,
 		ExitPrice:  fillPrice,
-		Qty:        qty,
+		Qty:        pos.Qty,
 		Fees:       pos.EntryFee + fee,
 		PnLQuote:   pnl,
 		PnLPct:     pnlPct,
 		ExitReason: reason,
 	})
 	delete(b.positions, symbol)
+	return true
 }
 
 // markFilled updates the recorded Order for clientOrderID to FILLED. It is
@@ -348,6 +366,18 @@ func (b *PaperBroker) markFilled(clientOrderID string, qty decimal.Decimal, avgP
 	o.AvgPrice = decimal.NewFromFloat(avgPrice)
 	o.Fee = decimal.NewFromFloat(fee)
 	o.Status = "FILLED"
+	b.seen[clientOrderID] = o
+}
+
+// markCanceled marks a pending order as CANCELED without touching cash,
+// fees or the trade log — used when an exit order's target position is
+// already gone by the time its bar arrives (see fillPending's sell case).
+func (b *PaperBroker) markCanceled(clientOrderID string) {
+	o, ok := b.seen[clientOrderID]
+	if !ok {
+		return
+	}
+	o.Status = "CANCELED"
 	b.seen[clientOrderID] = o
 }
 
@@ -396,6 +426,11 @@ func (b *PaperBroker) Submit(ctx context.Context, req domain.OrderRequest) (doma
 		} else {
 			if _, open := b.positions[req.Symbol]; !open {
 				return domain.Order{}, fmt.Errorf("broker: submit %s: no open position to exit", req.Symbol)
+			}
+			for _, po := range b.pending {
+				if po.req.Symbol == req.Symbol && po.req.Side == domain.SideSell {
+					return domain.Order{}, fmt.Errorf("broker: submit %s: an exit order is already pending for this symbol", req.Symbol)
+				}
 			}
 		}
 		b.pending = append(b.pending, pendingOrder{req: req})
@@ -478,6 +513,22 @@ func lastClose(series []domain.Candle, cursor int) float64 {
 func (b *PaperBroker) ClosedTrades() []ClosedTrade {
 	out := make([]ClosedTrade, len(b.trades))
 	copy(out, b.trades)
+	return out
+}
+
+// ClosedTradesSince returns trades closed at index n or later (n is a
+// previously observed len(b.trades)/count), copying only that tail
+// instead of the full history. For a caller that polls once per
+// simulated day for "what closed today" (internal/backtest.Run, for the
+// cooldown clock and the circuit breaker), calling plain ClosedTrades()
+// every day would copy the whole, ever-growing trade list on every poll —
+// O(days*trades) over a full backtest instead of the O(trades) this gives.
+func (b *PaperBroker) ClosedTradesSince(n int) []ClosedTrade {
+	if n >= len(b.trades) {
+		return nil
+	}
+	out := make([]ClosedTrade, len(b.trades)-n)
+	copy(out, b.trades[n:])
 	return out
 }
 

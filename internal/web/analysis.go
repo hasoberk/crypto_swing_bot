@@ -6,22 +6,17 @@ import (
 
 // drawdownSeries turns an equity curve into an underwater curve: at each
 // point, the percentage below the running peak so far (SPEC.md Bölüm
-// 7.3 madde 4).
+// 7.3 madde 4). Shares backtest.RunningPeakDrawdown with Metrics'
+// MaxDrawdown/MaxDDDuration and yearlyBreakdown below, so this chart can
+// never numerically disagree with the metrics table on the same page.
 func drawdownSeries(equity []backtest.EquityPoint) []point {
 	if len(equity) == 0 {
 		return nil
 	}
+	fracBelowPeak, _ := backtest.RunningPeakDrawdown(equity, equity[0].Equity, equity[0].Date)
 	out := make([]point, len(equity))
-	peak := equity[0].Equity
 	for i, p := range equity {
-		if p.Equity > peak {
-			peak = p.Equity
-		}
-		dd := 0.0
-		if peak > 0 {
-			dd = (p.Equity - peak) / peak * 100
-		}
-		out[i] = point{X: p.Date, Y: dd}
+		out[i] = point{X: p.Date, Y: fracBelowPeak[i] * 100}
 	}
 	return out
 }
@@ -37,47 +32,44 @@ type yearRow struct {
 // yearlyBreakdown groups equity into calendar years. A year's Return is
 // measured from the last equity point before that year began (or the
 // series' first point, for the first year) to the year's last point;
-// MaxDrawdown resets to that same starting point at the top of the year.
+// MaxDrawdown resets to that same starting point at the top of the year
+// (via backtest.RunningPeakDrawdown's seed parameters — see drawdownSeries).
 func yearlyBreakdown(equity []backtest.EquityPoint) []yearRow {
 	if len(equity) == 0 {
 		return nil
 	}
 
 	var rows []yearRow
-	curYear := equity[0].Date.Year()
 	yearStart := equity[0].Equity
-	peak := yearStart
-	var maxDD float64
+	seedPeak, seedDate := yearStart, equity[0].Date
+	start := 0
+	curYear := equity[0].Date.Year()
 
-	for i, p := range equity {
-		if p.Date.Year() != curYear {
-			prevEquity := equity[i-1].Equity
-			ret := 0.0
-			if yearStart != 0 {
-				ret = prevEquity/yearStart - 1
-			}
-			rows = append(rows, yearRow{Year: curYear, Return: ret, MaxDrawdown: maxDD})
-
-			curYear = p.Date.Year()
-			yearStart = prevEquity
-			peak = yearStart
-			maxDD = 0
-		}
-		if p.Equity > peak {
-			peak = p.Equity
-		}
-		if peak > 0 {
-			if dd := (p.Equity - peak) / peak; dd < maxDD {
+	flush := func(end int) {
+		fracBelowPeak, _ := backtest.RunningPeakDrawdown(equity[start:end], seedPeak, seedDate)
+		maxDD := 0.0
+		for _, dd := range fracBelowPeak {
+			if dd < maxDD {
 				maxDD = dd
 			}
 		}
+		ret := 0.0
+		if yearStart != 0 {
+			ret = equity[end-1].Equity/yearStart - 1
+		}
+		rows = append(rows, yearRow{Year: curYear, Return: ret, MaxDrawdown: maxDD})
 	}
-	last := equity[len(equity)-1].Equity
-	ret := 0.0
-	if yearStart != 0 {
-		ret = last/yearStart - 1
+
+	for i, p := range equity {
+		if p.Date.Year() != curYear {
+			flush(i)
+			yearStart = equity[i-1].Equity
+			seedPeak, seedDate = yearStart, equity[i-1].Date
+			start = i
+			curYear = p.Date.Year()
+		}
 	}
-	rows = append(rows, yearRow{Year: curYear, Return: ret, MaxDrawdown: maxDD})
+	flush(len(equity))
 
 	return rows
 }

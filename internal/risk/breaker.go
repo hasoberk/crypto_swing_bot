@@ -131,10 +131,30 @@ func (b *Breaker) RecordOrderError(oe OrderError) {
 // open, and even when no condition trips), since peak-equity tracking must
 // continue uninterrupted for drawdown to mean anything after a manual
 // Reset.
+//
+// Check also prunes b.errors down to the trailing 24h window it evaluates
+// rule 4 against, every call, regardless of Open — RecordOrderError is
+// documented to be called in chronological order, so an error older than
+// the window can never become relevant to a LATER call either (now only
+// moves forward), and without this a bot running for years would carry an
+// ever-growing error log that every single Check call rescans in full for
+// no reason. b.trades is NOT pruned the same way: rule 2 (consecutive
+// losses) needs however much of the recent streak preceded now, which is
+// not bounded by a fixed calendar window the way rule 4 is.
 func (b *Breaker) Check(equity float64, now time.Time) State {
 	if equity > b.peakEquity {
 		b.peakEquity = equity
 	}
+
+	cutoff := now.Add(-24 * time.Hour)
+	kept := b.errors[:0]
+	for _, oe := range b.errors {
+		if !oe.At.Before(cutoff) {
+			kept = append(kept, oe)
+		}
+	}
+	b.errors = kept
+
 	if b.state.Open {
 		return b.state
 	}
@@ -201,11 +221,13 @@ func (b *Breaker) Check(equity float64, now time.Time) State {
 		}
 	}
 
-	// 4. Order errors in the trailing 24h window.
-	cutoff := now.Add(-24 * time.Hour)
+	// 4. Order errors in the trailing 24h window. b.errors was already
+	// pruned to exactly this window at the top of Check; a defensive
+	// !oe.At.After(now) filter guards against an out-of-order/future-dated
+	// RecordOrderError call rather than trusting the pruning alone.
 	errCount := 0
 	for _, oe := range b.errors {
-		if !oe.At.Before(cutoff) && !oe.At.After(now) {
+		if !oe.At.After(now) {
 			errCount++
 		}
 	}

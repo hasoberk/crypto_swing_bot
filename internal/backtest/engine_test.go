@@ -11,6 +11,7 @@ import (
 
 	"swingbot/internal/broker"
 	"swingbot/internal/domain"
+	"swingbot/internal/risk"
 	"swingbot/internal/strategy"
 )
 
@@ -58,18 +59,21 @@ func (s buyAndHoldStrategy) Evaluate(in strategy.Input) ([]domain.Signal, error)
 
 // allInRiskGate sizes every entry to "spend all available cash", so the
 // golden test's return is directly comparable to a raw price ratio
-// instead of the (unrelated) risk-per-trade formula SimpleRiskGate uses.
+// instead of the (unrelated) risk-per-trade formula risk.Sizer uses.
 type allInRiskGate struct{}
 
-func (allInRiskGate) Size(s domain.Signal, p domain.Portfolio) (decimal.Decimal, string) {
-	if p.Cash <= 0 {
-		return decimal.Zero, "insufficient_cash"
+func (allInRiskGate) Evaluate(s domain.Signal, in risk.GateInput) risk.Decision {
+	if s.Kind != domain.SignalEnter {
+		return risk.Decision{Signal: s, Approved: true}
 	}
-	qty := decimal.NewFromFloat(p.Cash / s.RefPrice).Truncate(8)
+	if in.Portfolio.Cash <= 0 {
+		return risk.Decision{Signal: s, Approved: false, Reason: "insufficient_cash"}
+	}
+	qty := decimal.NewFromFloat(in.Portfolio.Cash / s.RefPrice).Truncate(8)
 	if !qty.IsPositive() {
-		return decimal.Zero, "below_min_qty"
+		return risk.Decision{Signal: s, Approved: false, Reason: "below_min_qty"}
 	}
-	return qty, ""
+	return risk.Decision{Signal: s, Approved: true, Size: risk.SizeResult{Qty: qty, Accepted: true}}
 }
 
 // TestGolden_BuyAndHoldMatchesRawBTCReturn is SPEC.md Bölüm 12's single

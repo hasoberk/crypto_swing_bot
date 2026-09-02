@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"swingbot/internal/domain"
@@ -99,6 +100,59 @@ func (s *Store) GetCandles(ctx context.Context, symbol, timeframe string, from, 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: get candles %s %s: %w", symbol, timeframe, err)
+	}
+	return out, nil
+}
+
+// GetCandlesForSymbols is GetCandles for many symbols in one round trip.
+// Store enforces a single SQLite connection (see Open's doc comment:
+// concurrent readers would just queue behind it, not actually run in
+// parallel), so a caller that needs dozens of symbols' history — backtest
+// loading its candle set, universe.Build scanning every market — pays one
+// query-planning/round-trip cost here instead of len(symbols) of them.
+// Symbols with no matching rows are simply absent from the result map
+// (same "no error, just empty" contract as GetCandles).
+func (s *Store) GetCandlesForSymbols(ctx context.Context, symbols []string, timeframe string, from, to time.Time) (map[string][]domain.Candle, error) {
+	if len(symbols) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(symbols))
+	args := make([]any, 0, len(symbols)+3)
+	for i, sym := range symbols {
+		placeholders[i] = "?"
+		args = append(args, sym)
+	}
+	query := fmt.Sprintf(`
+		SELECT symbol, open_time, open, high, low, close, volume, quote_volume
+		FROM candles WHERE symbol IN (%s) AND timeframe = ? AND open_time >= ?
+	`, strings.Join(placeholders, ","))
+	args = append(args, timeframe, toUnixMs(from))
+	if !to.IsZero() {
+		query += ` AND open_time <= ?`
+		args = append(args, toUnixMs(to))
+	}
+	query += ` ORDER BY symbol ASC, open_time ASC`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: get candles for %d symbols %s: %w", len(symbols), timeframe, err)
+	}
+	defer rows.Close()
+
+	out := make(map[string][]domain.Candle, len(symbols))
+	for rows.Next() {
+		var symbol string
+		var c domain.Candle
+		var openTime int64
+		if err := rows.Scan(&symbol, &openTime, &c.Open, &c.High, &c.Low, &c.Close, &c.Volume, &c.QuoteVolume); err != nil {
+			return nil, fmt.Errorf("store: get candles for %d symbols %s: scan: %w", len(symbols), timeframe, err)
+		}
+		c.OpenTime = fromUnixMs(openTime)
+		out[symbol] = append(out[symbol], c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: get candles for %d symbols %s: %w", len(symbols), timeframe, err)
 	}
 	return out, nil
 }

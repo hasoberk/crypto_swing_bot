@@ -290,7 +290,15 @@ func isLeveraged(symbol string, patterns []string) bool {
 // is by definition the most recent CLOSED bar (SPEC.md Strategy.Input doc
 // comment — "Son eleman AS-OF mumudur ve KAPANMIŞTIR"), so validating with
 // now=asOf would incorrectly flag it as a future/unclosed candle.
-func recentQualityIssues(symbol string, candles []domain.Candle, asOf time.Time, lookbackDays int, tf time.Duration) []datafeed.QualityIssue {
+// candlesInWindow returns the (chronologically ordered) subset of candles
+// with OpenTime in [asOf-lookbackDays, asOf] inclusive on both ends. The
+// single shared window filter behind recentQualityIssues and
+// medianQuoteVolume below — both need "the trailing N days ending at
+// asOf", and having them independently reimplement the same boundary
+// check risked the liquidity filter and the quality-flag filter silently
+// disagreeing about which candles count as "recent" if one were ever
+// tweaked without the other.
+func candlesInWindow(candles []domain.Candle, asOf time.Time, lookbackDays int) []domain.Candle {
 	windowStart := asOf.AddDate(0, 0, -lookbackDays)
 	window := make([]domain.Candle, 0, lookbackDays+1)
 	for _, c := range candles {
@@ -298,6 +306,11 @@ func recentQualityIssues(symbol string, candles []domain.Candle, asOf time.Time,
 			window = append(window, c)
 		}
 	}
+	return window
+}
+
+func recentQualityIssues(symbol string, candles []domain.Candle, asOf time.Time, lookbackDays int, tf time.Duration) []datafeed.QualityIssue {
+	window := candlesInWindow(candles, asOf, lookbackDays)
 	if len(window) == 0 {
 		return nil
 	}
@@ -323,15 +336,13 @@ func qualityIssueSummary(issues []datafeed.QualityIssue) string {
 // OpenTime falls in (asOf-lookbackDays, asOf]. ok is false if the window is
 // empty.
 func medianQuoteVolume(candles []domain.Candle, asOf time.Time, lookbackDays int) (float64, bool) {
-	windowStart := asOf.AddDate(0, 0, -lookbackDays)
-	vols := make([]float64, 0, lookbackDays+1)
-	for _, c := range candles {
-		if !c.OpenTime.Before(windowStart) && !c.OpenTime.After(asOf) {
-			vols = append(vols, c.QuoteVolume)
-		}
-	}
-	if len(vols) == 0 {
+	window := candlesInWindow(candles, asOf, lookbackDays)
+	if len(window) == 0 {
 		return 0, false
+	}
+	vols := make([]float64, len(window))
+	for i, c := range window {
+		vols[i] = c.QuoteVolume
 	}
 	sort.Float64s(vols)
 	n := len(vols)

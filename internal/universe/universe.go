@@ -71,16 +71,29 @@ func Build(ctx context.Context, st *store.Store, timeframe string, asOf time.Tim
 	lookback := candleLookbackDays(p)
 	from := asOf.AddDate(0, 0, -lookback)
 
-	candidates := make([]Candidate, 0, len(markets))
+	wantedMarkets := make([]store.Market, 0, len(markets))
+	symbols := make([]string, 0, len(markets))
 	for _, m := range markets {
 		if m.Quote != p.Quote {
 			continue
 		}
-		candles, err := st.GetCandles(ctx, m.Symbol, timeframe, from, asOf)
-		if err != nil {
-			return nil, fmt.Errorf("universe: build: get candles %s: %w", m.Symbol, err)
-		}
-		candidates = append(candidates, Candidate{Market: toDomainMarket(m), Candles: candles})
+		wantedMarkets = append(wantedMarkets, m)
+		symbols = append(symbols, m.Symbol)
+	}
+
+	// One round trip for every symbol's candles instead of one per symbol
+	// (store enforces a single SQLite connection — see store.Open's doc
+	// comment — so N sequential calls here paid N query round trips for
+	// no parallelism benefit; markets is already symbol-ordered, so
+	// iterating wantedMarkets below keeps candidate order deterministic).
+	candlesBySymbol, err := st.GetCandlesForSymbols(ctx, symbols, timeframe, from, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("universe: build: get candles: %w", err)
+	}
+
+	candidates := make([]Candidate, 0, len(wantedMarkets))
+	for _, m := range wantedMarkets {
+		candidates = append(candidates, Candidate{Market: toDomainMarket(m), Candles: candlesBySymbol[m.Symbol]})
 	}
 
 	filtered := Filter(asOf, candidates, p)

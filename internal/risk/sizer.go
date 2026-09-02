@@ -164,9 +164,12 @@ func (s *Sizer) Size(signal domain.Signal, portfolio domain.Portfolio, market do
 
 	minNotional, _ := market.MinNotional.Float64()
 	if minNotional > 0 && notional < minNotional {
+		// Qty/Notional are deliberately left zero here, matching this
+		// struct's own doc comment ("Zero when Accepted is false") and
+		// the other two rejection paths above — a caller must never be
+		// able to read a non-zero Qty off a SizeResult without also
+		// checking Accepted.
 		return SizeResult{
-			Qty:                    qty,
-			Notional:               notional,
 			Reason:                 ReasonBelowMinNotional,
 			CappedByCash:           cappedByCash,
 			CappedByMaxPositionPct: cappedByPositionPct,

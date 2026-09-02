@@ -168,6 +168,47 @@ func TestCandlesUpsertIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestGetCandlesForSymbols checks the batched multi-symbol reader against
+// GetCandles called once per symbol: same data, one round trip instead of
+// N, and a symbol with no rows is simply absent (not an error, not an
+// empty-slice entry).
+func TestGetCandlesForSymbols(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	btc := []domain.Candle{
+		{OpenTime: base, Open: 1, High: 2, Low: 0.5, Close: 1.5, Volume: 100, QuoteVolume: 150},
+		{OpenTime: base.AddDate(0, 0, 1), Open: 1.5, High: 2.5, Low: 1, Close: 2, Volume: 110, QuoteVolume: 220},
+	}
+	eth := []domain.Candle{
+		{OpenTime: base, Open: 10, High: 12, Low: 9, Close: 11, Volume: 50, QuoteVolume: 550},
+	}
+	if err := s.UpsertCandles(ctx, "BTC/USDT", "1d", btc); err != nil {
+		t.Fatalf("UpsertCandles BTC: %v", err)
+	}
+	if err := s.UpsertCandles(ctx, "ETH/USDT", "1d", eth); err != nil {
+		t.Fatalf("UpsertCandles ETH: %v", err)
+	}
+
+	got, err := s.GetCandlesForSymbols(ctx, []string{"BTC/USDT", "ETH/USDT", "DOGE/USDT"}, "1d", base, time.Time{})
+	if err != nil {
+		t.Fatalf("GetCandlesForSymbols: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 symbols in result (DOGE/USDT has no rows), got %d: %v", len(got), got)
+	}
+	if len(got["BTC/USDT"]) != 2 || got["BTC/USDT"][0].Close != 1.5 || got["BTC/USDT"][1].Close != 2 {
+		t.Errorf("BTC/USDT candles = %+v, want the 2 upserted above in order", got["BTC/USDT"])
+	}
+	if len(got["ETH/USDT"]) != 1 || got["ETH/USDT"][0].Close != 11 {
+		t.Errorf("ETH/USDT candles = %+v, want the 1 upserted above", got["ETH/USDT"])
+	}
+	if _, present := got["DOGE/USDT"]; present {
+		t.Errorf("DOGE/USDT has no rows and should be absent from the map, not present with an empty slice")
+	}
+}
+
 func TestProposalLifecycle(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

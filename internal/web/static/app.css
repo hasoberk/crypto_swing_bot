@@ -1,0 +1,339 @@
+/* SPEC.md Bölüm 7.2 — panel tasarım yönü.
+ * Bu bir ölçüm cihazı, bir pazarlama sayfası değil. Renk tokenları,
+ * tipografi ve hareket bütçesi burada tanımlanır ve tüm sayfalarda
+ * değişmeden uygulanır. */
+
+:root {
+  --ground: #e6e9e4;
+  --ink: #16191c;
+  --hairline: #c2c7c1;
+  --ghost: #98a199;
+  --gain: #1f6f4a;
+  --loss: #a32e22;
+  --pending: #c9782f;
+
+  --font-data: ui-monospace, "SF Mono", "JetBrains Mono", monospace;
+  --font-label: "Inter Tight", "IBM Plex Sans Condensed", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-label);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+/* Veri ve sayılar: monospace, sütun hizalaması zorunlu. */
+.num,
+table td.num,
+.equity-header .value,
+.metric .value {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Etiketler ve başlıklar: sıkı grotesk, büyük harf, geniş harf aralığı, küçük punto. */
+h1,
+h2,
+h3,
+.label,
+th,
+nav a,
+.badge,
+.section-title {
+  font-family: var(--font-label);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 15px;
+  margin: 0;
+}
+
+h2.section-title,
+.section-title {
+  font-size: 11px;
+  color: var(--ghost);
+  margin: 0 0 8px 0;
+}
+
+a {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Klavye odağı her zaman görünür kalmalı. */
+a:focus-visible,
+button:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+header.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--hairline);
+  flex-wrap: wrap;
+}
+
+nav.tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+nav.tabs a {
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  border-radius: 2px;
+}
+
+nav.tabs a.active {
+  border-color: var(--hairline);
+  background: rgba(22, 25, 28, 0.04);
+}
+
+.health-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ghost);
+  margin-right: 6px;
+}
+
+.health-dot.ok {
+  background: var(--gain);
+}
+
+.health-dot.down {
+  background: var(--loss);
+}
+
+main {
+  padding: 20px;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+section {
+  margin-bottom: 28px;
+}
+
+.card {
+  border: 1px solid var(--hairline);
+  border-radius: 2px;
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.metric .label {
+  font-size: 10px;
+  color: var(--ghost);
+  display: block;
+  margin-bottom: 4px;
+}
+
+.metric .value {
+  font-size: 20px;
+}
+
+.metric .value.gain {
+  color: var(--gain);
+}
+
+.metric .value.loss {
+  color: var(--loss);
+}
+
+.metric .value.pending {
+  color: var(--pending);
+}
+
+#equity-chart {
+  width: 100%;
+  height: 320px;
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.legend {
+  display: flex;
+  gap: 16px;
+  font-size: 11px;
+  color: var(--ghost);
+  margin-top: 6px;
+}
+
+.legend .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 2px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+
+th {
+  color: var(--ghost);
+  font-weight: 600;
+  font-size: 10px;
+}
+
+td.num,
+th.num {
+  text-align: right;
+}
+
+tr:hover td {
+  background: rgba(22, 25, 28, 0.03);
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border: 1px solid var(--hairline);
+  border-radius: 2px;
+  font-size: 9px;
+}
+
+.badge.gain {
+  color: var(--gain);
+  border-color: var(--gain);
+}
+
+.badge.loss {
+  color: var(--loss);
+  border-color: var(--loss);
+}
+
+.badge.pending {
+  color: var(--pending);
+  border-color: var(--pending);
+}
+
+.badge.ghost {
+  color: var(--ghost);
+}
+
+.filters {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+select,
+input[type="date"] {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+  background: var(--ground);
+  border: 1px solid var(--hairline);
+  color: var(--ink);
+  padding: 4px 6px;
+  border-radius: 2px;
+}
+
+.empty-state {
+  color: var(--ghost);
+  font-size: 12px;
+  padding: 24px 0;
+  text-align: center;
+}
+
+.reason-list {
+  font-size: 12px;
+}
+
+.reason-list dt {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.reason-list dd {
+  color: var(--ghost);
+  margin: 0 0 8px 0;
+}
+
+footer {
+  padding: 20px;
+  text-align: center;
+  color: var(--ghost);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* Hareket eden bir sayı, güvenilmez bir sayıdır: geçişler kısa ve sade. */
+* {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .card,
+  .badge {
+    transition: background-color 120ms ease;
+  }
+}
+
+@media (max-width: 640px) {
+  main {
+    padding: 12px;
+  }
+
+  header.topbar {
+    padding: 10px 12px;
+  }
+
+  table {
+    display: block;
+    overflow-x: auto;
+  }
+
+  #equity-chart {
+    height: 220px;
+  }
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>swingbot — panel</title>
+<meta name="color-scheme" content="light">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>swingbot</h1>
+  <nav class="tabs" id="nav">
+    <a href="/" data-path="/">genel bakış</a>
+    <a href="/positions" data-path="/positions">pozisyonlar</a>
+    <a href="/proposals" data-path="/proposals">öneriler</a>
+    <a href="/trades" data-path="/trades">işlemler</a>
+    <a href="/runs" data-path="/runs">koşular</a>
+    <a href="/universe" data-path="/universe">evren</a>
+  </nav>
+  <div id="health-indicator">
+    <span class="health-dot" id="health-dot"></span><span id="health-text" class="num">—</span>
+  </div>
+</header>
+
+<main id="app" aria-live="polite">
+  <p class="empty-state">yükleniyor…</p>
+</main>
+
+<footer>salt okunur panel — onay yalnızca telegram üzerinden yapılır</footer>
+
+<script src="/vendor/lightweight-charts.standalone.js"></script>
+<script src="/app.js" defer></script>
+</body>
+</html>

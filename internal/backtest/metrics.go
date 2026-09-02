@@ -42,6 +42,41 @@ type Metrics struct {
 	BenchTop10 *Metrics
 }
 
+// RunningPeakDrawdown is the single shared implementation behind
+// Metrics.MaxDrawdown/MaxDDDuration (below), internal/web's drawdown
+// chart, and its yearly breakdown table — all three used to independently
+// re-derive "walk equity, track a running peak, measure how far below it
+// we are" and could silently disagree with each other on the same report
+// page. seedPeak/seedPeakDate are the peak in effect BEFORE equity[0] (for
+// a whole-run computation, pass equity[0].Equity/.Date; for a per-
+// calendar-year slice, pass the prior year's closing equity/date so the
+// year's drawdown is measured against where the curve actually stood
+// entering that year, not reset to zero at the year boundary).
+//
+// fracBelowPeak[i] is (equity[i]-peak)/peak, always <= 0. daysSincePeak[i]
+// is how many days have elapsed since the running peak was last set at or
+// before i — the standard equivalent way to derive "how long has the
+// current drawdown lasted" without a second pass.
+func RunningPeakDrawdown(equity []EquityPoint, seedPeak float64, seedPeakDate time.Time) (fracBelowPeak []float64, daysSincePeak []int) {
+	if len(equity) == 0 {
+		return nil, nil
+	}
+	fracBelowPeak = make([]float64, len(equity))
+	daysSincePeak = make([]int, len(equity))
+	peak, peakDate := seedPeak, seedPeakDate
+	for i, p := range equity {
+		if p.Equity >= peak {
+			peak = p.Equity
+			peakDate = p.Date
+		}
+		if peak > 0 {
+			fracBelowPeak[i] = (p.Equity - peak) / peak
+		}
+		daysSincePeak[i] = int(p.Date.Sub(peakDate).Hours() / 24)
+	}
+	return fracBelowPeak, daysSincePeak
+}
+
 // Compute derives Metrics from a daily equity curve and the trades closed
 // during it. It never sets BenchBTC/BenchTop10 — callers (Run) compute
 // those independently via BuyAndHoldCurve/Top10EqualWeightCurve and a
@@ -80,20 +115,13 @@ func Compute(equity []EquityPoint, trades []broker.ClosedTrade) Metrics {
 		m.Sortino = mean / downside * math.Sqrt(365)
 	}
 
-	peak := first.Equity
-	peakDate := first.Date
-	for _, p := range equity {
-		if p.Equity >= peak {
-			peak = p.Equity
-			peakDate = p.Date
+	fracBelowPeak, daysSincePeak := RunningPeakDrawdown(equity, first.Equity, first.Date)
+	for i := range fracBelowPeak {
+		if fracBelowPeak[i] < m.MaxDrawdown {
+			m.MaxDrawdown = fracBelowPeak[i]
 		}
-		if peak > 0 {
-			if dd := (p.Equity - peak) / peak; dd < m.MaxDrawdown {
-				m.MaxDrawdown = dd
-			}
-		}
-		if durDays := int(p.Date.Sub(peakDate).Hours() / 24); durDays > m.MaxDDDuration {
-			m.MaxDDDuration = durDays
+		if daysSincePeak[i] > m.MaxDDDuration {
+			m.MaxDDDuration = daysSincePeak[i]
 		}
 	}
 	if m.MaxDrawdown < 0 {

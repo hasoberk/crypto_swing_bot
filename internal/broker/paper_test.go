@@ -217,6 +217,42 @@ func TestLongOnlyGuardsRejectSecondEntry(t *testing.T) {
 	}
 }
 
+// TestSubmitRejectsDuplicateExit protects against a duplicate/retried
+// exit submission (e.g. a buggy Strategy emitting two SignalExit entries
+// for the same symbol in one Evaluate call) queuing two pending sells for
+// the same position. Before this guard existed, the second sell's
+// settleExit would silently no-op after the first closed the position,
+// while markFilled still recorded it as a fabricated FILLED trade.
+func TestSubmitRejectsDuplicateExit(t *testing.T) {
+	candles := map[string][]domain.Candle{
+		"BTC/USDT": {candle(0, 100, 105, 95, 102), candle(1, 110, 112, 108, 111), candle(2, 111, 115, 109, 112)},
+	}
+	b := mustBroker(t, candles, 10000, testCosts)
+	ctx := context.Background()
+	must(t, b.Advance(ctx, day(0)))
+
+	_, err := b.Submit(ctx, domain.OrderRequest{ClientOrderID: "e1", Symbol: "BTC/USDT", Side: domain.SideBuy, Type: "market", Qty: decimal.NewFromInt(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(t, b.Advance(ctx, day(1))) // entry fills
+
+	_, err = b.Submit(ctx, domain.OrderRequest{ClientOrderID: "x1", Symbol: "BTC/USDT", Side: domain.SideSell, Type: "market", Qty: decimal.NewFromInt(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.Submit(ctx, domain.OrderRequest{ClientOrderID: "x2", Symbol: "BTC/USDT", Side: domain.SideSell, Type: "market", Qty: decimal.NewFromInt(1)})
+	if err == nil {
+		t.Fatalf("expected an error submitting a second exit while one is already pending")
+	}
+
+	must(t, b.Advance(ctx, day(2))) // x1 fills; must be the only closed trade
+	trades := b.ClosedTrades()
+	if len(trades) != 1 {
+		t.Fatalf("want exactly 1 closed trade, got %d: %+v", len(trades), trades)
+	}
+}
+
 func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
