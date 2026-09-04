@@ -1095,6 +1095,7 @@ func newPaperCmd() *cobra.Command {
 	start.Flags().String("strategy", "", "koşturulacak strateji (config.yaml'daki strategy.active'i geçersiz kılar)")
 	start.Flags().Float64("capital", 10000, "başlangıç sermayesi (quote para birimi, örn. USDT) — SPEC.md config şemasında henüz bir alanı yok")
 	start.Flags().StringArray("config-override", nil, "config.yaml alanını geçersiz kılar, örn. strategy.trendfollow.atr_stop_mult=3.0 (tekrarlanabilir)")
+	start.Flags().Bool("once", false, "execution.run_at_utc'yi beklemeden bugünün döngüsünü hemen bir kez çalıştırır ve çıkar (smoke test için)")
 	cmd.AddCommand(start)
 	return cmd
 }

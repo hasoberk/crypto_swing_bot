@@ -35,6 +35,11 @@ func runPaperStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	once, err := cmd.Flags().GetBool("once")
+	if err != nil {
+		return err
+	}
 	if err := applyConfigOverrides(cfg, overrides); err != nil {
 		return err
 	}
@@ -110,6 +115,19 @@ func runPaperStart(cmd *cobra.Command, args []string) error {
 	defer stop()
 
 	go tg.Start(sigCtx)
+
+	if once {
+		fmt.Printf("paper trading (--once): strateji=%s sermaye=%.2f %s bugünün döngüsü hemen çalıştırılıyor\n",
+			strat.Name(), capital, cfg.Exchange.Quote)
+		if err := eng.ResumePending(sigCtx); err != nil {
+			return fmt.Errorf("paper start --once: resume pending: %w", err)
+		}
+		if err := eng.RunOnce(sigCtx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("paper start --once: %w", err)
+		}
+		fmt.Println("paper trading (--once) tamamlandı")
+		return nil
+	}
 
 	fmt.Printf("paper trading başladı: strateji=%s sermaye=%.2f %s günlük çalışma saati (UTC)=%s (durdurmak için Ctrl+C)\n",
 		strat.Name(), capital, cfg.Exchange.Quote, cfg.Execution.RunAtUTC)

@@ -275,6 +275,67 @@ func (e *Engine) reconstruct(ctx context.Context) (*daySnapshot, error) {
 	}, nil
 }
 
+// syncTrades syncs the store's durable trades table (what /api/positions
+// and /api/trades read — SPEC.md Bölüm 7.1) to pb's current truth. Callers
+// invoke this at the true end of their work (after RunOnce's exit/stop and
+// submitApproved steps, or unconditionally at the end of ResumePending) —
+// not from inside reconstruct itself — since both of those can still submit
+// new orders into pb after reconstruct's own replay loop has already run.
+func (e *Engine) syncTrades(ctx context.Context, pb *broker.PaperBroker) error {
+	portfolio, err := pb.Portfolio(ctx)
+	if err != nil {
+		return fmt.Errorf("engine: sync trades: portfolio: %w", err)
+	}
+	if err := e.cfg.Store.ReplaceTrades(ctx, "paper", tradeRows(portfolio, pb.ClosedTrades())); err != nil {
+		return fmt.Errorf("engine: sync trades: %w", err)
+	}
+	return nil
+}
+
+// tradeRows converts a freshly-reconstructed PaperBroker's truth (open
+// positions + every closed round-trip) into the store.Trade rows
+// ReplaceTrades should sync to. IDs are deterministic within a single call
+// (derived from symbol, which PaperBroker guarantees at most one open
+// position for, and from closed's own slice index) — reconstruct always
+// passes the complete set to ReplaceTrades, which deletes-then-inserts, so
+// these only ever need to be unique within that one call, not stable across
+// calls.
+func tradeRows(portfolio domain.Portfolio, closed []broker.ClosedTrade) []store.Trade {
+	rows := make([]store.Trade, 0, len(portfolio.Positions)+len(closed))
+	for i, tr := range closed {
+		exitPrice := tr.ExitPrice
+		pnlQuote := tr.PnLQuote
+		pnlPct := tr.PnLPct
+		rows = append(rows, store.Trade{
+			ID:         fmt.Sprintf("paper-closed-%d-%s", i, tr.Symbol),
+			Symbol:     tr.Symbol,
+			Strategy:   tr.Strategy,
+			EntryTime:  tr.EntryTime,
+			EntryPrice: tr.EntryPrice,
+			ExitTime:   tr.ExitTime,
+			ExitPrice:  &exitPrice,
+			Qty:        tr.Qty.String(),
+			Fees:       tr.Fees,
+			PnLQuote:   &pnlQuote,
+			PnLPct:     &pnlPct,
+			ExitReason: tr.ExitReason,
+			Mode:       "paper",
+		})
+	}
+	for symbol, pos := range portfolio.Positions {
+		rows = append(rows, store.Trade{
+			ID:         "paper-open-" + symbol,
+			Symbol:     symbol,
+			Strategy:   pos.Strategy,
+			EntryTime:  pos.EntryTime,
+			EntryPrice: pos.EntryPrice,
+			Qty:        pos.Qty.String(),
+			Mode:       "paper",
+		})
+	}
+	return rows
+}
+
 // loadDecidedProposalsByDay returns every proposal that ever resulted in an
 // actual broker submission (APPROVED, SUBMITTED or FILLED — see the Status
 // doc comments in store/proposals.go), bucketed by AsOf day and sorted by
@@ -474,6 +535,10 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	// 13. onaylananlar → broker.Submit().
 	for _, p := range approved {
 		e.submitApproved(ctx, snap, p)
+	}
+
+	if err := e.syncTrades(ctx, snap.pb); err != nil {
+		return fmt.Errorf("engine: %w", err)
 	}
 
 	// 14. equity_snapshots'a yaz (İ3: benchmark ile birlikte).
@@ -786,25 +851,37 @@ func (e *Engine) ResumePending(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("engine: list pending proposals: %w", err)
 	}
-	if len(pending) == 0 {
-		return nil
+
+	var approved []store.Proposal
+	if len(pending) > 0 {
+		approved, err = e.awaitDecisions(ctx, pending)
+		if err != nil {
+			return fmt.Errorf("engine: resume await decisions: %w", err)
+		}
 	}
 
-	approved, err := e.awaitDecisions(ctx, pending)
+	// Always reconstruct (and sync the trades table to it), even if there
+	// was nothing PENDING: a prior run may have exited between a proposal
+	// being decided and the next scheduled RunOnce syncing that decision's
+	// effect, and a cold start otherwise has no other opportunity to bring
+	// /api/positions and /api/trades (SPEC.md Bölüm 7.1) up to date before
+	// tomorrow's run — see the package doc comment on reconstruct being the
+	// single source of truth for paper-trading state, every call.
+	snap, err := e.reconstruct(ctx)
 	if err != nil {
-		return fmt.Errorf("engine: resume await decisions: %w", err)
+		return fmt.Errorf("engine: resume reconstruct: %w", err)
 	}
+	if err := e.syncTrades(ctx, snap.pb); err != nil {
+		return fmt.Errorf("engine: resume %w", err)
+	}
+
 	if len(approved) == 0 {
 		return nil
 	}
-
 	// approved proposals are already persisted as APPROVED (awaitDecisions
-	// did that) — reconstruct's replay picks them straight up and submits
-	// them, so there is nothing left to submit here; just settle the
-	// bookkeeping status.
-	if _, err := e.reconstruct(ctx); err != nil {
-		return fmt.Errorf("engine: resume reconstruct: %w", err)
-	}
+	// did that) — reconstruct's replay above already picked them straight up
+	// and submitted them into snap.pb, so there is nothing left to submit
+	// here; just settle the bookkeeping status.
 	now := e.cfg.Clock.Now()
 	for _, p := range approved {
 		if err := e.cfg.Store.UpdateProposalStatus(ctx, p.ID, store.ProposalSubmitted, now, ""); err != nil {

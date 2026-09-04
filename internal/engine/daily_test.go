@@ -123,13 +123,16 @@ func TestResumePending_ExpiresPastDeadline(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 
-	ex := &fakeExchange{}
-	feed := datafeed.NewFeed(ex, st, "1d")
+	candles := map[string][]domain.Candle{"AAA/USDT": flatCandles(0, 5, 100)}
+	seedMarketsAndCandles(t, ctx, st, candles, nil, "USDT")
+	ex := &fakeExchange{markets: []domain.Market{mustMarket("AAA/USDT", "AAA", "USDT")}}
+	feed := datafeed.NewFeed(ex, st, "1d", datafeed.WithQuoteFilter("USDT"))
 	notifier := newFakeNotifier() // never sends a decision
 
 	eng, err := New(Config{
 		Store: st, Feed: feed, Strategy: fakeStrategy{StratName: "test"}, Notifier: notifier,
 		RiskGate: defaultRiskGate(), Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 1000,
+		Timeframe: "1d", Quote: "USDT",
 		Clock: newFakeClock(day(0).Add(2 * time.Hour)),
 	})
 	if err != nil {

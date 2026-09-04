@@ -199,6 +199,40 @@ func (s *Store) ListTrades(ctx context.Context, mode, symbol string) ([]Trade, e
 	return out, nil
 }
 
+// ReplaceTrades atomically replaces every trades row for mode with rows,
+// inside one transaction (delete-then-insert): the caller — internal/engine's
+// reconstruct, which recomputes the entire paper/live trade history from
+// scratch on every call (see that package's doc comment) — always has the
+// complete, authoritative set for mode, never a delta, so a full sync here
+// (rather than an incremental Insert/Close pair per trade) is what keeps the
+// trades table idempotent under repeated reconstruction instead of
+// accumulating duplicate rows.
+func (s *Store) ReplaceTrades(ctx context.Context, mode string, rows []Trade) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: replace trades: begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM trades WHERE mode = ?`, mode); err != nil {
+		return fmt.Errorf("store: replace trades: delete: %w", err)
+	}
+	for _, t := range rows {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO trades (id, symbol, strategy, entry_time, entry_price, exit_time, exit_price,
+				qty, fees, pnl_quote, pnl_pct, exit_reason, mode)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, t.ID, t.Symbol, t.Strategy, toUnixMs(t.EntryTime), t.EntryPrice, toUnixMsPtr(t.ExitTime), t.ExitPrice,
+			t.Qty, t.Fees, t.PnLQuote, t.PnLPct, nullIfEmpty(t.ExitReason), t.Mode); err != nil {
+			return fmt.Errorf("store: replace trades: insert %s: %w", t.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: replace trades: commit: %w", err)
+	}
+	return nil
+}
+
 // --- equity_snapshots ----------------------------------------------------
 
 // EquitySnapshot is the store's row shape for the equity_snapshots table: a
