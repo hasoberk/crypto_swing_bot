@@ -147,6 +147,25 @@ func (c Config) validate() error {
 // second encoding for the same value.
 const breakerStateKey = "breaker"
 
+// orderErrorsStateKey is the system_state key Engine persists risk.Breaker's
+// order-error history under, for the max_order_errors_24h trip condition
+// (SPEC.md Bölüm 6.5.3 rule 4) to survive a process restart.
+//
+// risk.Breaker.RecordOrderError only ever appends to an in-memory slice
+// (see that package's doc comment) and reconstruct always builds a brand
+// new *risk.Breaker (see Config.BreakerCfg's doc comment) — without this,
+// a crash right after an order failure would make the next reconstruction
+// forget it ever happened, letting the breaker evaluate rule 4 more
+// optimistically than it should right when a restart is already the
+// riskiest possible moment to do so.
+//
+// This mirrors persistBreakerState's own choice of system_state over a new
+// table/migration: order volume here is small (order FAILURES, not every
+// order), so a JSON blob under one more system_state key is simpler than
+// wiring internal/store's orders table (currently unused by this package
+// for anything) into the breaker's restart path.
+const orderErrorsStateKey = "order_errors"
+
 // Engine drives SPEC.md Bölüm 6.7's daily loop. It holds no portfolio
 // state of its own between calls — see the package doc comment — so a
 // zero-value Engine plus a fresh New call is exactly as capable as one
@@ -180,6 +199,10 @@ type daySnapshot struct {
 
 	breaker    *risk.Breaker
 	lastExitAt map[string]time.Time
+	// orderErrors is the trailing-24h-pruned order-error history reconstruct
+	// loaded from orderErrorsStateKey and fed into breaker — see
+	// recordOrderError, the only place this is appended to afterwards.
+	orderErrors []risk.OrderError
 
 	asOf               time.Time // calendar[len(calendar)-1]
 	portfolio          domain.Portfolio
@@ -227,6 +250,13 @@ func (e *Engine) reconstruct(ctx context.Context) (*daySnapshot, error) {
 	}
 
 	brk := risk.NewBreaker(e.cfg.BreakerCfg)
+	orderErrors, err := e.loadOrderErrors(ctx, e.cfg.Clock.Now())
+	if err != nil {
+		return nil, fmt.Errorf("engine: load order errors: %w", err)
+	}
+	for _, oe := range orderErrors {
+		brk.RecordOrderError(oe)
+	}
 	lastExitAt := make(map[string]time.Time)
 	tradesSeen := 0
 	var todaysClosedTrades []broker.ClosedTrade
@@ -270,9 +300,71 @@ func (e *Engine) reconstruct(ctx context.Context) (*daySnapshot, error) {
 
 	return &daySnapshot{
 		pb: pb, calendar: calendar, candles: candles, dateIndex: dateIndex, markets: markets,
-		breaker: brk, lastExitAt: lastExitAt,
+		breaker: brk, lastExitAt: lastExitAt, orderErrors: orderErrors,
 		asOf: calendar[len(calendar)-1], portfolio: finalPortfolio, todaysClosedTrades: todaysClosedTrades,
 	}, nil
+}
+
+// loadOrderErrors reads risk.Breaker's persisted order-error history (see
+// orderErrorsStateKey's doc comment), pruned to the trailing 24h as of now.
+// Pruning on load (in addition to risk.Breaker.Check's own pruning of its
+// in-memory copy) keeps the system_state blob itself from growing without
+// bound across a long-running paper/live bot.
+func (e *Engine) loadOrderErrors(ctx context.Context, now time.Time) ([]risk.OrderError, error) {
+	raw, ok, err := e.cfg.Store.GetState(ctx, orderErrorsStateKey)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	var errs []risk.OrderError
+	if err := json.Unmarshal([]byte(raw), &errs); err != nil {
+		return nil, fmt.Errorf("decode %s state: %w", orderErrorsStateKey, err)
+	}
+	cutoff := now.Add(-24 * time.Hour)
+	kept := errs[:0]
+	for _, oe := range errs {
+		if !oe.At.Before(cutoff) {
+			kept = append(kept, oe)
+		}
+	}
+	return kept, nil
+}
+
+// recordOrderError implements SPEC.md Bölüm 6.5.3 rule 4's restart
+// durability: it records at both in snap.breaker's in-memory history (so
+// the very next Check call in THIS run already sees it — unchanged
+// behavior) and in snap.orderErrors, which it then re-prunes to the
+// trailing 24h and persists to orderErrorsStateKey so a freshly
+// reconstructed Engine (after a crash or a normal restart) feeds the exact
+// same history back into a brand new *risk.Breaker — see reconstruct.
+//
+// A persistence failure here is only ever reported via notify, never
+// returned: it must not mask the order failure the caller is already in
+// the middle of handling, and the in-memory record (which is what THIS
+// run's own Check calls consult) is unaffected either way.
+func (e *Engine) recordOrderError(ctx context.Context, snap *daySnapshot, at time.Time) {
+	snap.breaker.RecordOrderError(risk.OrderError{At: at})
+
+	snap.orderErrors = append(snap.orderErrors, risk.OrderError{At: at})
+	cutoff := at.Add(-24 * time.Hour)
+	kept := snap.orderErrors[:0]
+	for _, oe := range snap.orderErrors {
+		if !oe.At.Before(cutoff) {
+			kept = append(kept, oe)
+		}
+	}
+	snap.orderErrors = kept
+
+	raw, err := json.Marshal(snap.orderErrors)
+	if err != nil {
+		e.notify(ctx, notify.LevelWarning, "Sipariş hata geçmişi kaydedilemedi", err.Error())
+		return
+	}
+	if err := e.cfg.Store.SetState(ctx, orderErrorsStateKey, string(raw)); err != nil {
+		e.notify(ctx, notify.LevelWarning, "Sipariş hata geçmişi kaydedilemedi", err.Error())
+	}
 }
 
 // syncTrades syncs the store's durable trades table (what /api/positions
@@ -508,7 +600,7 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	for _, s := range exits {
 		if err := e.processExitOrStop(ctx, snap, s, now, asOf); err != nil {
 			e.notify(ctx, notify.LevelWarning, fmt.Sprintf("Emir hatası · %s", s.Symbol), err.Error())
-			snap.breaker.RecordOrderError(risk.OrderError{At: now})
+			e.recordOrderError(ctx, snap, now)
 		}
 	}
 	snap.breaker.Check(snap.portfolio.Equity, now) // re-evaluate breaker.max_order_errors_24h before sizing entries
@@ -834,7 +926,7 @@ func (e *Engine) submitApproved(ctx context.Context, snap *daySnapshot, p store.
 	if err != nil {
 		_ = e.cfg.Store.UpdateProposalStatus(ctx, p.ID, store.ProposalFailed, now, "")
 		e.notify(ctx, notify.LevelWarning, fmt.Sprintf("Emir hatası · %s", p.Symbol), err.Error())
-		snap.breaker.RecordOrderError(risk.OrderError{At: now})
+		e.recordOrderError(ctx, snap, now)
 		return
 	}
 	_ = e.cfg.Store.UpdateProposalStatus(ctx, p.ID, store.ProposalSubmitted, now, orderID)

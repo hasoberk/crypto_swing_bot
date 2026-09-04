@@ -352,6 +352,93 @@ func TestBreakerTrip_BlocksNewEntryButAllowsExit(t *testing.T) {
 	}
 }
 
+// --- order-error history: durable across a restart (SPEC.md Bölüm 6.5.3
+// rule 4 / Bölüm 6.7 restart resilience) -----------------------------------
+
+// TestOrderErrorHistory_PersistsAcrossRestart verifies that recordOrderError's
+// durable copy of risk.Breaker's order-error history (system_state's
+// "order_errors" key) survives a process restart: a brand new Engine, with a
+// brand new in-memory *risk.Breaker built by reconstruct, must still count
+// an order failure recorded by a PREVIOUS Engine instance — exactly what a
+// crash between two order failures must not be allowed to forget.
+//
+// The error is recorded "on day 1" and only actually trips the breaker
+// once reconstruct evaluates rule 4 for "day 2" — matching how every other
+// rule in risk.Breaker.Check is evaluated once per replayed calendar day
+// (calendar-midnight granularity, not wall-clock granularity), not a defect
+// specific to this test.
+func TestOrderErrorHistory_PersistsAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Only day(0)/day(1) exist yet — day(2) (the "restart, new data has
+	// arrived" day) is appended further down, once the pre-restart Engine
+	// has already recorded its order error against day(1).
+	seedMarketsAndCandles(t, ctx, st, map[string][]domain.Candle{"AAA/USDT": flatCandles(0, 2, 100)}, nil, "USDT")
+	ex := &fakeExchange{markets: []domain.Market{mustMarket("AAA/USDT", "AAA", "USDT")}}
+	feed := datafeed.NewFeed(ex, st, "1d", datafeed.WithQuoteFilter("USDT"))
+
+	breakerCfg := config.BreakerConfig{MaxOrderErrors24h: 1, MaxConsecutiveLosses: 1000, MaxDrawdown: 1, MaxDailyLoss: 1}
+
+	newEngine := func(clock *fakeClock) *Engine {
+		eng, err := New(Config{
+			Store: st, Feed: feed, Strategy: fakeStrategy{StratName: "test"}, Notifier: newFakeNotifier(),
+			RiskGate: defaultRiskGate(), BreakerCfg: breakerCfg,
+			Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 100000,
+			Timeframe: "1d", Quote: "USDT", Clock: clock,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return eng
+	}
+
+	// --- "day 1": reconstruct (breaker starts clean), then an order
+	// submission fails (e.g. resubmitDecidedProposal blowing up inside
+	// processExitOrStop/submitApproved) and is recorded.
+	clock1 := newFakeClock(day(1).Add(5 * time.Minute))
+	eng1 := newEngine(clock1)
+	snap1, err := eng1.reconstruct(ctx)
+	if err != nil {
+		t.Fatalf("reconstruct day1: %v", err)
+	}
+	if !snap1.asOf.Equal(day(1)) {
+		t.Fatalf("snap1.asOf = %s, want day(1)", snap1.asOf)
+	}
+	if snap1.breaker.Open() {
+		t.Fatal("breaker unexpectedly open before any order error")
+	}
+	eng1.recordOrderError(ctx, snap1, clock1.Now())
+
+	raw, ok, err := st.GetState(ctx, orderErrorsStateKey)
+	if err != nil || !ok || raw == "" {
+		t.Fatalf("GetState(%s) after recordOrderError: ok=%v err=%v raw=%q", orderErrorsStateKey, ok, err, raw)
+	}
+
+	// --- "process restarts, a new day's data has landed": brand new
+	// Engine, brand new *risk.Breaker (reconstruct never reuses one across
+	// calls — see Config.BreakerCfg's doc comment).
+	if err := st.UpsertCandles(ctx, "AAA/USDT", "1d", flatCandles(2, 1, 100)); err != nil {
+		t.Fatalf("seed day2 candle: %v", err)
+	}
+	clock2 := newFakeClock(day(2).Add(5 * time.Minute))
+	eng2 := newEngine(clock2)
+	snap2, err := eng2.reconstruct(ctx)
+	if err != nil {
+		t.Fatalf("reconstruct day2 (post-restart): %v", err)
+	}
+	if !snap2.asOf.Equal(day(2)) {
+		t.Fatalf("snap2.asOf = %s, want day(2)", snap2.asOf)
+	}
+
+	if !snap2.breaker.Open() {
+		t.Fatal("breaker not open after restart — persisted order-error history was not picked back up by reconstruct")
+	}
+	if snap2.breaker.State().Reason != risk.BreakerReasonOrderErrors {
+		t.Errorf("breaker trip reason = %q, want %q", snap2.breaker.State().Reason, risk.BreakerReasonOrderErrors)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {
