@@ -33,6 +33,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -75,6 +77,60 @@ var (
 	cfg        *config.Config
 )
 
+// setupLogging wires config.yaml's `log:` block (SPEC.md Bölüm 8:
+// "level: info, file: ./data/swingbot.log") into log/slog's global
+// default logger, so packages that already call slog.Default()/slog.Info
+// etc. (e.g. internal/datafeed) — and any future one — actually honor the
+// configured level and land in the configured file instead of silently
+// falling back to slog's own zero-value default (info level, stderr,
+// never touching log.file). This is pure plumbing: it introduces no new
+// logging call sites, only makes the ones that already exist obey config.
+//
+// An empty log.File keeps logging on stderr (useful for an interactive
+// `swingbot backtest` run); a non-empty one additionally writes there,
+// which matters most for `swingbot paper start`/`live start` running
+// unattended for days (SPEC.md Bölüm 12 Faz 4: "8 hafta kesintisiz
+// çalışma") — without this, an overnight crash left no record beyond
+// whatever terminal happened to be attached.
+func setupLogging(cfg config.LogConfig) error {
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(cfg.Level)) {
+	case "", "info":
+		level = slog.LevelInfo
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return fmt.Errorf("bilinmeyen log.level: %q (bilinenler: debug, info, warn, error)", cfg.Level)
+	}
+
+	var out io.Writer = os.Stderr
+	if cfg.File != "" {
+		if dir := filepath.Dir(cfg.File); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("log dizini oluşturulamadı (%s): %w", dir, err)
+			}
+		}
+		f, err := os.OpenFile(cfg.File, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		// Deliberately not closed: this file must stay open for the
+		// process's entire lifetime (it is now the global slog output).
+		// swingbot is a short-lived CLI process per invocation (even
+		// `paper start`/`live start` exit only on signal/crash), so this
+		// is not an accumulating leak — there is exactly one such logger
+		// per process.
+		out = io.MultiWriter(os.Stderr, f)
+	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})))
+	return nil
+}
+
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
 		// cobra has already printed the error (SilenceUsage suppresses the
@@ -114,6 +170,14 @@ Henüz yazılmamış katmanlara bağlı komutlar, o katman tamamlanana kadar
 				fmt.Fprintf(os.Stderr, "uyarı: %s\n", w)
 			}
 			cfg = loaded
+
+			if err := setupLogging(loaded.Log); err != nil {
+				// A log file that cannot be opened must not silently leave
+				// the operator with no logs at all during an unattended
+				// paper/live run (SPEC.md Bölüm 8 log.file) — fail loudly
+				// instead, same as any other config problem here.
+				return fmt.Errorf("log dosyası açılamadı (log.file=%s): %w", loaded.Log.File, err)
+			}
 			return nil
 		},
 	}
@@ -1293,30 +1357,124 @@ func runBreakerReset(cmd *cobra.Command, args []string) error {
 
 // --- report / positions ---------------------------------------------------
 
+// newReportCmd backs `swingbot report --run=<id>` (SPEC.md Bölüm 9). The
+// HTML report itself is already generated and written to disk by
+// `swingbot backtest`/`walkforward` at run time (internal/web's
+// WriteReportFile/WriteWalkForwardReportFile, Ajan 6/10); a run's
+// runs.report_path already points at that file (internal/store, Ajan 2).
+// So this command does no new report generation — it just looks the run up
+// and tells the operator where its report lives (SPEC.md Bölüm 7.3: "tek
+// dosya... Ctrl+P ile arşivlenir", i.e. it is meant to be opened directly,
+// not re-rendered).
 func newReportCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "report",
-		Short: "Belirli bir koşum (run) için tek dosyalık HTML raporu üretir",
-		RunE: notImplemented(
-			"report",
-			"internal/web (report.go) + internal/store",
-			"panel-developer (Ajan 12) / backtest-engine-architect (Ajan 6)",
-		),
+		Short: "Belirli bir koşum (run) için üretilmiş HTML rapor dosyasının yolunu gösterir",
+		RunE:  runReport,
 	}
-	cmd.Flags().String("run", "", "rapor üretilecek koşum kimliği")
+	cmd.Flags().String("run", "", "rapor üretilecek koşum kimliği (zorunlu)")
 	return cmd
 }
 
-func newPositionsCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "positions",
-		Short: "Açık pozisyonları listeler",
-		RunE: notImplemented(
-			"positions",
-			"internal/store + internal/engine",
-			"storage-engineer (Ajan 2) / live-engine-notify-engineer (Ajan 11)",
-		),
+func runReport(cmd *cobra.Command, args []string) error {
+	runID, err := cmd.Flags().GetString("run")
+	if err != nil {
+		return err
 	}
+	if runID == "" {
+		return errors.New("--run bayrağı zorunlu (örn. --run=bt-20260815-120000.000, bkz. `swingbot backtest`/`walkforward` çıktısı ya da web panelindeki /runs sayfası)")
+	}
+
+	ctx := cmd.Context()
+	st, err := store.Open(ctx, cfg.Data.DBPath)
+	if err != nil {
+		return fmt.Errorf("veritabanı açılamadı (data.db_path=%s): %w", cfg.Data.DBPath, err)
+	}
+	defer st.Close()
+
+	run, ok, err := st.GetRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("koşum okunamadı: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("koşum bulunamadı: %q (bkz. `swingbot serve` üzerinden /api/runs)", runID)
+	}
+	if run.ReportPath == "" {
+		return fmt.Errorf("koşum %q için kayıtlı bir rapor dosyası yok (report_path boş)", runID)
+	}
+	if _, err := os.Stat(run.ReportPath); err != nil {
+		return fmt.Errorf("koşum %q rapor dosyası diskte bulunamadı (%s): %w — dosya taşınmış veya silinmiş olabilir", runID, run.ReportPath, err)
+	}
+
+	fmt.Printf("koşum:     %s\n", run.ID)
+	fmt.Printf("strateji:  %s\n", run.Strategy)
+	fmt.Printf("aralık:    %s → %s\n", run.StartTS.Format("2006-01-02"), run.EndTS.Format("2006-01-02"))
+	fmt.Printf("oluşturma: %s UTC\n", run.CreatedAt.UTC().Format("2006-01-02 15:04:05"))
+	if run.GitSHA != "" {
+		fmt.Printf("git sha:   %s\n", run.GitSHA)
+	}
+	fmt.Printf("rapor:     %s\n", run.ReportPath)
+	return nil
+}
+
+// newPositionsCmd backs `swingbot positions` (SPEC.md Bölüm 9). SPEC.md
+// Bölüm 4.1 has no separate positions table — an open position is a
+// trades row with no exit yet (exit_time IS NULL), the same convention
+// internal/web/api.go's handlePositions already relies on for the panel's
+// /api/positions. This command reuses that same convention directly from
+// internal/store rather than re-deriving positions from a live
+// broker.Portfolio() call, so it works even when no paper/live process is
+// currently running (reading the last synced state — see internal/engine's
+// syncTrades, which keeps this table current after every daily cycle).
+func newPositionsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "positions",
+		Short: "Açık pozisyonları listeler (son senkronize edilmiş durum, bkz. internal/store trades tablosu)",
+		RunE:  runPositions,
+	}
+	cmd.Flags().String("mode", "", "backtest|paper|live (varsayılan: config.yaml mode)")
+	return cmd
+}
+
+func runPositions(cmd *cobra.Command, args []string) error {
+	mode, err := cmd.Flags().GetString("mode")
+	if err != nil {
+		return err
+	}
+	if mode == "" {
+		mode = cfg.Mode
+	}
+
+	ctx := cmd.Context()
+	st, err := store.Open(ctx, cfg.Data.DBPath)
+	if err != nil {
+		return fmt.Errorf("veritabanı açılamadı (data.db_path=%s): %w", cfg.Data.DBPath, err)
+	}
+	defer st.Close()
+
+	trades, err := st.ListTrades(ctx, mode, "")
+	if err != nil {
+		return fmt.Errorf("işlemler okunamadı: %w", err)
+	}
+
+	var open []store.Trade
+	for _, t := range trades {
+		if t.ExitTime.IsZero() {
+			open = append(open, t)
+		}
+	}
+	if len(open) == 0 {
+		fmt.Printf("açık pozisyon yok (mod: %s)\n", mode)
+		return nil
+	}
+
+	fmt.Printf("%-14s %-12s %-24s %-12s %-10s\n", "SEMBOL", "STRATEJİ", "GİRİŞ ZAMANI (UTC)", "GİRİŞ FİYATI", "MİKTAR")
+	for _, t := range open {
+		fmt.Printf("%-14s %-12s %-24s %-12.4f %-10s\n",
+			t.Symbol, t.Strategy, t.EntryTime.UTC().Format("2006-01-02 15:04:05"), t.EntryPrice, t.Qty)
+	}
+	fmt.Printf("\n%d açık pozisyon (mod: %s). Stop mesafeleri ve güncel K/Z için `swingbot serve` → /positions panelini kullanın.\n", len(open), mode)
+	return nil
 }
 
 // --- version ---------------------------------------------------------------

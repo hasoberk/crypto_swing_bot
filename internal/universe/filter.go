@@ -33,7 +33,7 @@ import (
 // entries.
 
 const (
-	ReasonWrongQuote         = "wrong_quote"                // market.Quote != params.Quote (SPEC.md default "USDT")
+	ReasonWrongQuote         = "wrong_quote"                 // market.Quote != params.Quote (SPEC.md default "USDT")
 	ReasonInactiveAtDate     = "inactive_at_date"            // not listed_at <= asOf < delisted_at
 	ReasonUnknownListingDate = "unknown_listing_date"        // neither markets.listed_at nor a first candle available to derive age from
 	ReasonTooYoung           = "listing_age_below_minimum"   // age < MinListingAgeDays

@@ -91,8 +91,8 @@ otomatik durdurur ve yalnızca manuel müdahaleyle yeniden başlar.
 | Katman | Seçim | Gerekçe |
 |---|---|---|
 | Dil | Go 1.22+ | Derlenmiş, tek binary, düşük bellek, mükemmel HTTP/eşzamanlılık, kolay cross-compile |
-| Borsa erişimi | `github.com/ccxt/ccxt/go/v4` | Resmi CCXT Go paketi, REST desteği; çok borsalı soyutlama hazır |
-| Yedek borsa istemcisi | `github.com/adshao/go-binance/v2` | Binance'e özel, olgun; CCXT'de sorun çıkarsa alternatif |
+| Borsa erişimi | Doğrudan Binance REST + HMAC imzalama (`internal/exchange/ccxt.go`), CCXT ile **aynı arayüz şekli** | Bölüm 0'ın gereği olan sürüm doğrulaması (2026-08-15) `github.com/ccxt/ccxt/go/v4`'ün `go 1.23+`/`go 1.25+` gerektirdiğini ve tam blockchain/L2 istemci yığınlarını (go-ethereum, starknet.go, vb.) transitive bağımlılık olarak sürüklediğini gösterdi — bu, "tek binary" ve düşük kaynak tüketimi hedefleriyle çelişiyor. `exchange.Exchange` arayüzü CCXT'nin şekliyle birebir aynı bırakıldı; gerçek CCXT istemcisine geçiş yalnızca `internal/exchange/ccxt.go`'nun HTTP/imzalama iç kısmını değiştirmeyi gerektirir (bkz. o dosyanın başındaki not). |
+| Yedek borsa istemcisi | (kullanılmıyor) | Tek borsa (Binance) hedeflendiği için `github.com/adshao/go-binance/v2` gibi bir yedek istemciye şu an ihtiyaç yok; yukarıdaki satırın nedeniyle aynı gerekçeyle CCXT de yedek değil, birincil seçenekten çıkarıldı. |
 | Depolama | SQLite (`modernc.org/sqlite`) | Saf Go, cgo yok; tek dosya; sorgulanabilir; bu veri hacmi için fazlasıyla yeterli |
 | Ondalık aritmetik | `github.com/shopspring/decimal` | Emir miktarı/fiyatı yuvarlamada float64 hataları kabul edilemez |
 | CLI | `github.com/spf13/cobra` | Alt komut yapısı |
