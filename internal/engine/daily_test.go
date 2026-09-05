@@ -590,6 +590,69 @@ func TestSyncProposalFills_ResumePendingAlsoPromotes(t *testing.T) {
 	}
 }
 
+// TestSyncProposalFills_PromotesOrphanedApprovedProposal covers a proposal
+// stuck at APPROVED that never advanced to SUBMITTED — this happens for real
+// whenever a decision is recorded (awaitDecisions itself writes APPROVED)
+// but whatever normally follows it (RunOnce's submitApproved loop, or
+// ResumePending's own post-award "mark SUBMITTED" step) never ran for that
+// proposal, e.g. a process that recorded the decision and exited before
+// either of those. loadDecidedProposalsByDay/reconstruct already replay an
+// APPROVED proposal exactly like a SUBMITTED one — it still gets resubmitted
+// into pb and can still actually fill — so syncProposalFills must check both
+// statuses, or such a proposal stays invisible to /api/positions' stop
+// lookup forever even once its position is genuinely open.
+func TestSyncProposalFills_PromotesOrphanedApprovedProposal(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	candles := map[string][]domain.Candle{"AAA/USDT": flatCandles(0, 3, 100)}
+	seedMarketsAndCandles(t, ctx, st, candles, nil, "USDT")
+	ex := &fakeExchange{markets: []domain.Market{mustMarket("AAA/USDT", "AAA", "USDT")}}
+	feed := datafeed.NewFeed(ex, st, "1d", datafeed.WithQuoteFilter("USDT"))
+
+	notifier := newFakeNotifier()
+	clock := newFakeClock(day(0).Add(time.Hour))
+
+	eng, err := New(Config{
+		Store: st, Feed: feed, Strategy: fakeStrategy{StratName: "test"}, Notifier: notifier,
+		RiskGate: defaultRiskGate(), Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 100000,
+		Timeframe: "1d", Quote: "USDT", Clock: clock,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Inserted directly as APPROVED (not via InsertProposal+awaitDecisions'
+	// own PENDING->APPROVED transition) — this is what a proposal an
+	// external/short-lived process already decided, but never got to mark
+	// SUBMITTED, looks like in the store.
+	stop := 90.0
+	if err := st.InsertProposal(ctx, store.Proposal{
+		ID: "p-orphan-approved", CreatedAt: day(0), AsOf: day(0), Symbol: "AAA/USDT", Side: "long", Strategy: "test",
+		RefPrice: 100, StopPrice: &stop, Qty: "1", RiskAmount: 10, Reason: "orphaned approval test", MetricsJSON: "{}",
+		Status: store.ProposalApproved, ExpiresAt: day(0).Add(4 * time.Hour), DecidedAt: day(0).Add(90 * time.Minute),
+	}); err != nil {
+		t.Fatalf("InsertProposal: %v", err)
+	}
+
+	// No PENDING proposals exist, so ResumePending's own awaitDecisions/
+	// mark-SUBMITTED path never touches p-orphan-approved at all — the only
+	// thing that can still promote it is syncProposalFills checking APPROVED
+	// too. candles run day(0)..day(2), so reconstruct's replay carries the
+	// entry through its actual fill at day(1)'s open.
+	if err := eng.ResumePending(ctx); err != nil {
+		t.Fatalf("ResumePending: %v", err)
+	}
+
+	p, ok, err := st.GetProposal(ctx, "p-orphan-approved")
+	if err != nil || !ok {
+		t.Fatalf("GetProposal: ok=%v err=%v", ok, err)
+	}
+	if p.Status != store.ProposalFilled {
+		t.Errorf("status = %s, want FILLED (orphaned APPROVED proposal must still be promoted once its order fills)", p.Status)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {

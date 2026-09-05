@@ -401,11 +401,25 @@ func (e *Engine) syncTrades(ctx context.Context, pb *broker.PaperBroker) error {
 // markFilled entirely (see PaperBroker.Submit's stop_market case), so it is
 // left alone here on purpose, not an oversight.
 func (e *Engine) syncProposalFills(ctx context.Context, pb *broker.PaperBroker) error {
-	submitted, err := e.cfg.Store.ListProposalsByStatus(ctx, store.ProposalSubmitted)
-	if err != nil {
-		return fmt.Errorf("engine: sync proposal fills: list submitted: %w", err)
+	// APPROVED is included alongside SUBMITTED: loadDecidedProposalsByDay
+	// (and thus reconstruct's replay) already treats the two as equally
+	// "decided, resubmit into pb" — see that function's doc comment — so a
+	// proposal can reach an actual fill while its store row is still
+	// APPROVED if whatever approved it never got to the separate
+	// mark-as-SUBMITTED step (e.g. a decision recorded by a process that
+	// then exited before RunOnce's submitApproved loop or ResumePending's
+	// own post-award bookkeeping ran). Checking both statuses here is what
+	// keeps such a proposal from being stuck pre-FILLED forever even though
+	// its position is already live and visible in /api/positions.
+	var candidates []store.Proposal
+	for _, status := range []store.ProposalStatus{store.ProposalApproved, store.ProposalSubmitted} {
+		rows, err := e.cfg.Store.ListProposalsByStatus(ctx, status)
+		if err != nil {
+			return fmt.Errorf("engine: sync proposal fills: list %s: %w", status, err)
+		}
+		candidates = append(candidates, rows...)
 	}
-	for _, p := range submitted {
+	for _, p := range candidates {
 		var kind string
 		switch p.Side {
 		case "long":
