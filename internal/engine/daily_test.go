@@ -205,8 +205,13 @@ func TestResumePending_ApprovesAndSubmitsViaReplay(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("GetProposal: ok=%v err=%v", ok, err)
 	}
-	if p.Status != store.ProposalSubmitted {
-		t.Errorf("status = %s, want SUBMITTED", p.Status)
+	// candles run day(0)..day(4), so reconstruct's replay carries the entry
+	// order all the way through its actual fill (at day(1)'s open, per İ2) —
+	// syncProposalFills must have promoted it past SUBMITTED to FILLED
+	// (SPEC.md Bölüm 6.8's state machine; /api/positions' stop-distance
+	// display depends on this transition actually happening).
+	if p.Status != store.ProposalFilled {
+		t.Errorf("status = %s, want FILLED", p.Status)
 	}
 }
 
@@ -436,6 +441,152 @@ func TestOrderErrorHistory_PersistsAcrossRestart(t *testing.T) {
 	}
 	if snap2.breaker.State().Reason != risk.BreakerReasonOrderErrors {
 		t.Errorf("breaker trip reason = %q, want %q", snap2.breaker.State().Reason, risk.BreakerReasonOrderErrors)
+	}
+}
+
+// --- SUBMITTED -> FILLED (İ2: fill happens on the NEXT day's Advance,
+// never the day it was submitted) --------------------------------------
+
+// TestSyncProposalFills_PromotesOnceEntryActuallyFills reproduces exactly
+// the scenario cli-integration-lead's Bölüm 12 audit found broken:
+// proposals.status never reached FILLED, so /api/positions'
+// latestFilledStopBySymbol (SPEC.md Bölüm 7.1) could never find a stop to
+// show for an open position. It asserts BOTH halves of the fix:
+//   - the day an entry is approved and submitted, it must stay SUBMITTED
+//     (its market order has not filled yet — no later day's candle exists
+//     for Advance to fill it against) — this is the regression guard: a
+//     naive "SUBMITTED implies FILLED" fix would violate İ2.
+//   - once a later day's candle lands and the engine reconstructs again
+//     (a normal next RunOnce, exactly like the real paper session that
+//     triggered this audit), the SAME proposal must have been promoted to
+//     FILLED.
+func TestSyncProposalFills_PromotesOnceEntryActuallyFills(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	seedMarketsAndCandles(t, ctx, st, map[string][]domain.Candle{"AAA/USDT": flatCandles(0, 1, 100)}, nil, "USDT")
+	ex := &fakeExchange{markets: []domain.Market{mustMarket("AAA/USDT", "AAA", "USDT")}}
+	feed := datafeed.NewFeed(ex, st, "1d", datafeed.WithQuoteFilter("USDT"))
+
+	notifier := newFakeNotifier()
+	notifier.autoApprove = func(p notify.Proposal) (bool, bool) { return true, true }
+
+	strat := fakeStrategy{StratName: "test", EvalFunc: func(in strategy.Input) ([]domain.Signal, error) {
+		if _, open := in.Portfolio.Positions["AAA/USDT"]; open {
+			return nil, nil // already in a position; nothing more to propose
+		}
+		return []domain.Signal{{
+			AsOf: in.AsOf, Symbol: "AAA/USDT", Kind: domain.SignalEnter,
+			RefPrice: 100, StopPrice: 90, Reason: "test entry",
+		}}, nil
+	}}
+
+	clock := newFakeClock(day(1).Add(5 * time.Minute)) // -> candleDay = day(0)
+
+	eng, err := New(Config{
+		Store: st, Feed: feed, Strategy: strat, Notifier: notifier,
+		RiskGate: defaultRiskGate(), BreakerCfg: config.BreakerConfig{},
+		Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 100000,
+		UniverseParams: universe.FilterParams{Quote: "USDT"},
+		Timeframe:      "1d", Quote: "USDT",
+		ApprovalTTL: time.Hour, RunAtUTC: "00:05", PollInterval: time.Millisecond, Clock: clock,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Day 0: proposal approved and submitted. Only day(0)'s candle exists,
+	// so PaperBroker has no later bar to fill the entry order against yet.
+	if err := eng.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce day0: %v", err)
+	}
+	if len(notifier.proposals) != 1 {
+		t.Fatalf("ProposeTrade calls = %d, want 1", len(notifier.proposals))
+	}
+	propID := notifier.proposals[0].ID
+
+	p, ok, err := st.GetProposal(ctx, propID)
+	if err != nil || !ok {
+		t.Fatalf("GetProposal (day0): ok=%v err=%v", ok, err)
+	}
+	if p.Status != store.ProposalSubmitted {
+		t.Fatalf("status after day0 = %s, want SUBMITTED (regression: must not fabricate a fill before the next day's Advance)", p.Status)
+	}
+
+	// Day 1's candle lands (a normal datafeed.Update result) and the engine
+	// runs its next scheduled cycle — reconstruct's replay now advances
+	// PaperBroker through day(1), which is exactly the Advance call that
+	// fills the entry order queued on day(0) (İ2: signal at t, fill at
+	// t+1's open).
+	if err := st.UpsertCandles(ctx, "AAA/USDT", "1d", flatCandles(1, 1, 100)); err != nil {
+		t.Fatalf("seed day1 candle: %v", err)
+	}
+	clock.Set(day(2).Add(5 * time.Minute)) // -> candleDay = day(1)
+
+	if err := eng.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce day1: %v", err)
+	}
+
+	p, ok, err = st.GetProposal(ctx, propID)
+	if err != nil || !ok {
+		t.Fatalf("GetProposal (day1): ok=%v err=%v", ok, err)
+	}
+	if p.Status != store.ProposalFilled {
+		t.Errorf("status after day1 = %s, want FILLED", p.Status)
+	}
+}
+
+// TestSyncProposalFills_ResumePendingAlsoPromotes is the restart-resilience
+// counterpart: a proposal that reached SUBMITTED, then filled, must show up
+// as FILLED after ResumePending too (a cold start must reach the same
+// conclusion reconstruct/RunOnce would have) — this exercises the ordering
+// this fix depends on inside ResumePending (syncProposalFills must run
+// AFTER the "mark newly-approved proposals SUBMITTED" bookkeeping, or it
+// would query store.ProposalSubmitted too early and silently miss them).
+func TestSyncProposalFills_ResumePendingAlsoPromotes(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	candles := map[string][]domain.Candle{"AAA/USDT": flatCandles(0, 3, 100)}
+	seedMarketsAndCandles(t, ctx, st, candles, nil, "USDT")
+	ex := &fakeExchange{markets: []domain.Market{mustMarket("AAA/USDT", "AAA", "USDT")}}
+	feed := datafeed.NewFeed(ex, st, "1d", datafeed.WithQuoteFilter("USDT"))
+
+	notifier := newFakeNotifier()
+	clock := newFakeClock(day(0).Add(time.Hour))
+
+	eng, err := New(Config{
+		Store: st, Feed: feed, Strategy: fakeStrategy{StratName: "test"}, Notifier: notifier,
+		RiskGate: defaultRiskGate(), Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 100000,
+		Timeframe: "1d", Quote: "USDT", Clock: clock,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	stop := 90.0
+	if err := st.InsertProposal(ctx, store.Proposal{
+		ID: "p-fill-resume", CreatedAt: day(0), AsOf: day(0), Symbol: "AAA/USDT", Side: "long", Strategy: "test",
+		RefPrice: 100, StopPrice: &stop, Qty: "1", RiskAmount: 10, Reason: "resume fill test", MetricsJSON: "{}",
+		Status: store.ProposalPending, ExpiresAt: day(0).Add(4 * time.Hour),
+	}); err != nil {
+		t.Fatalf("InsertProposal: %v", err)
+	}
+	notifier.approvals <- notify.Decision{ProposalID: "p-fill-resume", Approved: true, At: day(0).Add(90 * time.Minute)}
+
+	// candles run day(0)..day(2), so reconstruct's replay (triggered inside
+	// ResumePending) carries the entry all the way through its actual fill
+	// at day(1)'s open before ResumePending returns.
+	if err := eng.ResumePending(ctx); err != nil {
+		t.Fatalf("ResumePending: %v", err)
+	}
+
+	p, ok, err := st.GetProposal(ctx, "p-fill-resume")
+	if err != nil || !ok {
+		t.Fatalf("GetProposal: ok=%v err=%v", ok, err)
+	}
+	if p.Status != store.ProposalFilled {
+		t.Errorf("status = %s, want FILLED", p.Status)
 	}
 }
 

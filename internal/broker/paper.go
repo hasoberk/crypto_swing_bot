@@ -459,6 +459,22 @@ func (b *PaperBroker) Submit(ctx context.Context, req domain.OrderRequest) (doma
 	return order, nil
 }
 
+// OrderStatus returns the current domain.Order.Status recorded for
+// clientOrderID ("PENDING", "ACCEPTED", "FILLED", or "CANCELED" — see
+// Submit/markFilled/markCanceled). ok is false if clientOrderID has never
+// been seen. This is a read-only accessor for callers (internal/engine)
+// that need to know whether a previously-submitted market order has
+// actually filled yet — a fill only ever happens on a LATER Advance call
+// than the one that queued it (İ2), so only PaperBroker itself can answer
+// that question.
+func (b *PaperBroker) OrderStatus(clientOrderID string) (status string, ok bool) {
+	o, ok := b.seen[clientOrderID]
+	if !ok {
+		return "", false
+	}
+	return o.Status, true
+}
+
 // Cancel removes a still-PENDING market order. Resting stop_market
 // "orders" are amendments, not queued fills, so there is nothing to
 // cancel for those beyond submitting a new stop_market to replace them.

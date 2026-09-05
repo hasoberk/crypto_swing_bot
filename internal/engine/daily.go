@@ -384,6 +384,52 @@ func (e *Engine) syncTrades(ctx context.Context, pb *broker.PaperBroker) error {
 	return nil
 }
 
+// syncProposalFills promotes every currently-SUBMITTED proposal to FILLED
+// once the market order it caused has actually filled inside pb — the
+// storage-engineer state machine's SUBMITTED→FILLED transition (SPEC.md
+// Bölüm 6.8), which nothing previously drove: submitApproved and
+// ResumePending's replay bookkeeping only ever set SUBMITTED, and a fill
+// only ever happens on a LATER Advance call than the one that queued it
+// (İ2) — so this has to be checked again on every reconstruct, not just
+// once at submit time. /api/positions' latestFilledStopBySymbol (SPEC.md
+// Bölüm 7.1) depends on this actually happening: it is the only place that
+// reads store.ProposalFilled to show an open position's stop distance.
+//
+// Only "long" (entry) and "exit" proposals ever cause a market order that
+// can reach FILLED in PaperBroker — a "stop_update" proposal's stop_market
+// order triggers straight into a ClosedTrade via checkStops, bypassing
+// markFilled entirely (see PaperBroker.Submit's stop_market case), so it is
+// left alone here on purpose, not an oversight.
+func (e *Engine) syncProposalFills(ctx context.Context, pb *broker.PaperBroker) error {
+	submitted, err := e.cfg.Store.ListProposalsByStatus(ctx, store.ProposalSubmitted)
+	if err != nil {
+		return fmt.Errorf("engine: sync proposal fills: list submitted: %w", err)
+	}
+	for _, p := range submitted {
+		var kind string
+		switch p.Side {
+		case "long":
+			kind = "entry"
+		case "exit":
+			kind = "exit"
+		default:
+			continue
+		}
+		status, ok := pb.OrderStatus(clientOrderID(p.ID, kind))
+		if !ok || status != "FILLED" {
+			continue
+		}
+		// Zero decidedAt/empty orderID: neither column needs to change here
+		// (decided_at already recorded the human's approval; order_id
+		// already recorded the order this fill belongs to) — only status
+		// moves (UpdateProposalStatus's own doc comment).
+		if err := e.cfg.Store.UpdateProposalStatus(ctx, p.ID, store.ProposalFilled, time.Time{}, ""); err != nil {
+			return fmt.Errorf("engine: sync proposal fills: %s: %w", p.ID, err)
+		}
+	}
+	return nil
+}
+
 // tradeRows converts a freshly-reconstructed PaperBroker's truth (open
 // positions + every closed round-trip) into the store.Trade rows
 // ReplaceTrades should sync to. IDs are deterministic within a single call
@@ -630,6 +676,9 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	}
 
 	if err := e.syncTrades(ctx, snap.pb); err != nil {
+		return fmt.Errorf("engine: %w", err)
+	}
+	if err := e.syncProposalFills(ctx, snap.pb); err != nil {
 		return fmt.Errorf("engine: %w", err)
 	}
 
@@ -967,18 +1016,27 @@ func (e *Engine) ResumePending(ctx context.Context) error {
 		return fmt.Errorf("engine: resume %w", err)
 	}
 
-	if len(approved) == 0 {
-		return nil
-	}
-	// approved proposals are already persisted as APPROVED (awaitDecisions
-	// did that) — reconstruct's replay above already picked them straight up
-	// and submitted them into snap.pb, so there is nothing left to submit
-	// here; just settle the bookkeeping status.
-	now := e.cfg.Clock.Now()
-	for _, p := range approved {
-		if err := e.cfg.Store.UpdateProposalStatus(ctx, p.ID, store.ProposalSubmitted, now, ""); err != nil {
-			return fmt.Errorf("engine: resume mark submitted %s: %w", p.ID, err)
+	if len(approved) > 0 {
+		// approved proposals are already persisted as APPROVED (awaitDecisions
+		// did that) — reconstruct's replay above already picked them straight
+		// up and submitted them into snap.pb, so there is nothing left to
+		// submit here; just settle the bookkeeping status.
+		now := e.cfg.Clock.Now()
+		for _, p := range approved {
+			if err := e.cfg.Store.UpdateProposalStatus(ctx, p.ID, store.ProposalSubmitted, now, ""); err != nil {
+				return fmt.Errorf("engine: resume mark submitted %s: %w", p.ID, err)
+			}
 		}
+	}
+
+	// Must run AFTER the SUBMITTED bookkeeping above (not before, and not
+	// folded into it): a proposal approved just now was only promoted from
+	// APPROVED to SUBMITTED in the loop above, so syncProposalFills's
+	// store.ProposalSubmitted query would miss it entirely if run any
+	// earlier — even though reconstruct's replay may already have advanced
+	// it all the way to an actual fill inside snap.pb.
+	if err := e.syncProposalFills(ctx, snap.pb); err != nil {
+		return fmt.Errorf("engine: resume %w", err)
 	}
 	return nil
 }
