@@ -33,8 +33,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -77,59 +75,8 @@ var (
 	cfg        *config.Config
 )
 
-// setupLogging wires config.yaml's `log:` block (SPEC.md Bölüm 8:
-// "level: info, file: ./data/swingbot.log") into log/slog's global
-// default logger, so packages that already call slog.Default()/slog.Info
-// etc. (e.g. internal/datafeed) — and any future one — actually honor the
-// configured level and land in the configured file instead of silently
-// falling back to slog's own zero-value default (info level, stderr,
-// never touching log.file). This is pure plumbing: it introduces no new
-// logging call sites, only makes the ones that already exist obey config.
-//
-// An empty log.File keeps logging on stderr (useful for an interactive
-// `swingbot backtest` run); a non-empty one additionally writes there,
-// which matters most for `swingbot paper start`/`live start` running
-// unattended for days (SPEC.md Bölüm 12 Faz 4: "8 hafta kesintisiz
-// çalışma") — without this, an overnight crash left no record beyond
-// whatever terminal happened to be attached.
-func setupLogging(cfg config.LogConfig) error {
-	level := slog.LevelInfo
-	switch strings.ToLower(strings.TrimSpace(cfg.Level)) {
-	case "", "info":
-		level = slog.LevelInfo
-	case "debug":
-		level = slog.LevelDebug
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		return fmt.Errorf("bilinmeyen log.level: %q (bilinenler: debug, info, warn, error)", cfg.Level)
-	}
-
-	var out io.Writer = os.Stderr
-	if cfg.File != "" {
-		if dir := filepath.Dir(cfg.File); dir != "." && dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("log dizini oluşturulamadı (%s): %w", dir, err)
-			}
-		}
-		f, err := os.OpenFile(cfg.File, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return err
-		}
-		// Deliberately not closed: this file must stay open for the
-		// process's entire lifetime (it is now the global slog output).
-		// swingbot is a short-lived CLI process per invocation (even
-		// `paper start`/`live start` exit only on signal/crash), so this
-		// is not an accumulating leak — there is exactly one such logger
-		// per process.
-		out = io.MultiWriter(os.Stderr, f)
-	}
-
-	slog.SetDefault(slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})))
-	return nil
-}
+// setupLogging is defined in logging.go (it also wires in the secret-masking
+// slog.Handler wrapper — SPEC.md Bölüm 13 "sırlar loglara yazılmıyor").
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
@@ -171,7 +118,7 @@ Henüz yazılmamış katmanlara bağlı komutlar, o katman tamamlanana kadar
 			}
 			cfg = loaded
 
-			if err := setupLogging(loaded.Log); err != nil {
+			if err := setupLogging(loaded.Log, loaded.Secrets); err != nil {
 				// A log file that cannot be opened must not silently leave
 				// the operator with no logs at all during an unattended
 				// paper/live run (SPEC.md Bölüm 8 log.file) — fail loudly
