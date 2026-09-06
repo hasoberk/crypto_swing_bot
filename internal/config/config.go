@@ -140,7 +140,18 @@ type CostsConfig struct {
 type ExecutionConfig struct {
 	OrderType        string `yaml:"order_type"`
 	ApprovalTTLHours int    `yaml:"approval_ttl_hours"`
-	RunAtUTC         string `yaml:"run_at_utc"`
+	// RunAtUTC is "HH:MM", the wall-clock time (in Timezone, below) the
+	// daily loop runs at — SPEC.md Bölüm 6.7 adım 1. The field name is
+	// kept for backward compatibility with deployed config.yaml files from
+	// before Timezone existed, when it really was always UTC.
+	RunAtUTC string `yaml:"run_at_utc"`
+	// Timezone is an IANA zone name (e.g. "Europe/Rome") RunAtUTC is
+	// interpreted in; empty means UTC (every deployment before this field
+	// existed). A real timezone rather than a fixed UTC offset is what
+	// keeps the run time pinned to true local midnight (or whatever
+	// RunAtUTC says) across DST transitions instead of drifting an hour
+	// twice a year.
+	Timezone string `yaml:"timezone"`
 }
 
 type TelegramConfig struct {

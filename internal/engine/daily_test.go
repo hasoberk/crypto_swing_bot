@@ -68,7 +68,7 @@ func TestRunOnce_ApprovedEntryIsSubmittedAndSummaryNotified(t *testing.T) {
 		Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 100000,
 		UniverseParams: universe.FilterParams{Quote: "USDT"},
 		Timeframe:      "1d", Quote: "USDT",
-		ApprovalTTL: time.Hour, RunAtUTC: "00:05", PollInterval: time.Millisecond, Clock: clock,
+		ApprovalTTL: time.Hour, RunAt: "00:05", PollInterval: time.Millisecond, Clock: clock,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -489,7 +489,7 @@ func TestSyncProposalFills_PromotesOnceEntryActuallyFills(t *testing.T) {
 		Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 100000,
 		UniverseParams: universe.FilterParams{Quote: "USDT"},
 		Timeframe:      "1d", Quote: "USDT",
-		ApprovalTTL: time.Hour, RunAtUTC: "00:05", PollInterval: time.Millisecond, Clock: clock,
+		ApprovalTTL: time.Hour, RunAt: "00:05", PollInterval: time.Millisecond, Clock: clock,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

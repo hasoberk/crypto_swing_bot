@@ -98,6 +98,11 @@ func runPaperStart(cmd *cobra.Command, args []string) error {
 	}
 	uWeights := universe.WeightsFromMap(cfg.Strategy.Momentum.Weights)
 
+	loc, err := resolveExecutionTimezone(cfg.Execution.Timezone)
+	if err != nil {
+		return fmt.Errorf("paper start: %w", err)
+	}
+
 	eng, err := engine.New(engine.Config{
 		Store: st, Feed: feed, Strategy: strat, Notifier: tg,
 		RiskGate: riskGate, BreakerCfg: cfg.Breaker,
@@ -105,7 +110,8 @@ func runPaperStart(cmd *cobra.Command, args []string) error {
 		UniverseParams: uParams, UniverseWeights: uWeights,
 		Timeframe: cfg.Data.Timeframe, Quote: cfg.Exchange.Quote,
 		ApprovalTTL: time.Duration(cfg.Execution.ApprovalTTLHours) * time.Hour,
-		RunAtUTC:    cfg.Execution.RunAtUTC,
+		RunAt:       cfg.Execution.RunAtUTC,
+		Location:    loc,
 	})
 	if err != nil {
 		return fmt.Errorf("paper start: %w", err)
@@ -129,12 +135,28 @@ func runPaperStart(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("paper trading başladı: strateji=%s sermaye=%.2f %s günlük çalışma saati (UTC)=%s (durdurmak için Ctrl+C)\n",
-		strat.Name(), capital, cfg.Exchange.Quote, cfg.Execution.RunAtUTC)
+	fmt.Printf("paper trading başladı: strateji=%s sermaye=%.2f %s günlük çalışma saati=%s (%s) (durdurmak için Ctrl+C)\n",
+		strat.Name(), capital, cfg.Exchange.Quote, cfg.Execution.RunAtUTC, loc)
 
 	if err := eng.Run(sigCtx); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("paper start: %w", err)
 	}
 	fmt.Println("paper trading durduruldu")
 	return nil
+}
+
+// resolveExecutionTimezone loads config.yaml's execution.timezone (an IANA
+// zone name, e.g. "Europe/Rome") into a *time.Location for
+// engine.Config.Location. An empty setting resolves to time.UTC — SPEC.md
+// Bölüm 6.7 adım 1's original "UTC 00:05" default, unchanged for every
+// config.yaml written before this field existed.
+func resolveExecutionTimezone(tz string) (*time.Location, error) {
+	if tz == "" {
+		return time.UTC, nil
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, fmt.Errorf("config.yaml execution.timezone %q geçersiz: %w", tz, err)
+	}
+	return loc, nil
 }

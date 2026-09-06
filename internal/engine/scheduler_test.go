@@ -40,7 +40,7 @@ func TestNextRunAt(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := NextRunAt(c.now, "00:05")
+			got, err := NextRunAt(c.now, "00:05", time.UTC)
 			if err != nil {
 				t.Fatalf("NextRunAt: %v", err)
 			}
@@ -53,9 +53,45 @@ func TestNextRunAt(t *testing.T) {
 
 func TestNextRunAtRejectsMalformedRunAtUTC(t *testing.T) {
 	for _, bad := range []string{"", "25:00", "12:60", "not-a-time", "12"} {
-		if _, err := NextRunAt(time.Now(), bad); err == nil {
+		if _, err := NextRunAt(time.Now(), bad, time.UTC); err == nil {
 			t.Errorf("NextRunAt with run_at_utc=%q: expected an error", bad)
 		}
+	}
+}
+
+// TestNextRunAt_TracksLocationDST proves NextRunAt("00:00", loc) really
+// means "local midnight in loc", auto-adjusting across a DST transition —
+// not a fixed UTC offset baked in once, which would drift an hour when
+// Europe/Rome switches between CEST (summer, UTC+2) and CET (winter,
+// UTC+1).
+func TestNextRunAt_TracksLocationDST(t *testing.T) {
+	rome, err := time.LoadLocation("Europe/Rome")
+	if err != nil {
+		t.Skipf("Europe/Rome tzdata not available: %v", err)
+	}
+
+	// Summer (CEST, UTC+2): local midnight is 22:00 UTC the day before.
+	summerNow := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	got, err := NextRunAt(summerNow, "00:00", rome)
+	if err != nil {
+		t.Fatalf("NextRunAt: %v", err)
+	}
+	wantSummer := time.Date(2026, 7, 10, 22, 0, 0, 0, time.UTC) // 2026-07-11 00:00 CEST
+	if !got.Equal(wantSummer) {
+		t.Errorf("summer: NextRunAt = %s (UTC), want %s (UTC)", got.UTC(), wantSummer)
+	}
+
+	// Winter (CET, UTC+1): local midnight is 23:00 UTC the day before —
+	// one hour later than summer's, purely because of the DST switch, with
+	// no config change in between.
+	winterNow := time.Date(2026, 12, 10, 12, 0, 0, 0, time.UTC)
+	got, err = NextRunAt(winterNow, "00:00", rome)
+	if err != nil {
+		t.Fatalf("NextRunAt: %v", err)
+	}
+	wantWinter := time.Date(2026, 12, 10, 23, 0, 0, 0, time.UTC) // 2026-12-11 00:00 CET
+	if !got.Equal(wantWinter) {
+		t.Errorf("winter: NextRunAt = %s (UTC), want %s (UTC)", got.UTC(), wantWinter)
 	}
 }
 
@@ -78,7 +114,7 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 			return nil, nil
 		}},
 		Costs: broker.Costs{FeeRate: 0.001, SlippageBps: 15}, InitialCash: 1000,
-		RunAtUTC: "00:05", Clock: clock,
+		RunAt: "00:05", Clock: clock,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

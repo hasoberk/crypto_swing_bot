@@ -10,19 +10,26 @@ import (
 	"swingbot/internal/notify"
 )
 
-// NextRunAt returns the next UTC instant at/after now that matches
-// runAtUTC ("HH:MM", config.yaml execution.run_at_utc — SPEC.md Bölüm 6.7
-// adım 1: "UTC 00:05, mum kapanışından 5 dk sonra"). now need not be UTC;
-// it is converted first. The returned time is always strictly in the
-// future relative to now (today's run_at_utc if it has not happened yet,
-// otherwise tomorrow's).
-func NextRunAt(now time.Time, runAtUTC string) (time.Time, error) {
-	now = now.UTC()
-	hh, mm, err := parseHHMM(runAtUTC)
+// NextRunAt returns the next instant at/after now whose WALL-CLOCK time in
+// loc matches runAt ("HH:MM", config.yaml execution.run_at_utc — SPEC.md
+// Bölüm 6.7 adım 1: "borsa verisinin oturması için mum kapanışından sonra").
+// loc is config.yaml execution.timezone (config.Config's
+// withDefaults/paper.go resolve an empty setting to time.UTC, matching the
+// SPEC default and every deployment before this field existed) — using
+// time.Date with an IANA *time.Location rather than a fixed UTC offset is
+// what makes this automatically track that zone's DST transitions (e.g.
+// Europe/Rome shifting between CET and CEST) instead of drifting an hour
+// twice a year the way a hardcoded UTC offset would. now need not already
+// be in loc; it is converted first. The returned time is always strictly
+// in the future relative to now (today's run_at if it has not happened
+// yet, otherwise tomorrow's).
+func NextRunAt(now time.Time, runAt string, loc *time.Location) (time.Time, error) {
+	hh, mm, err := parseHHMM(runAt)
 	if err != nil {
 		return time.Time{}, err
 	}
-	next := time.Date(now.Year(), now.Month(), now.Day(), hh, mm, 0, 0, time.UTC)
+	local := now.In(loc)
+	next := time.Date(local.Year(), local.Month(), local.Day(), hh, mm, 0, 0, loc)
 	if !next.After(now) {
 		next = next.AddDate(0, 0, 1)
 	}
@@ -64,7 +71,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	for {
-		next, err := NextRunAt(e.cfg.Clock.Now(), e.cfg.RunAtUTC)
+		next, err := NextRunAt(e.cfg.Clock.Now(), e.cfg.RunAt, e.cfg.Location)
 		if err != nil {
 			return err
 		}

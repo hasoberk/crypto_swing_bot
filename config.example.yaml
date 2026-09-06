@@ -58,7 +58,8 @@ costs:                           # İ4: zorunlu, sıfır olamaz
 execution:
   order_type: market
   approval_ttl_hours: 4
-  run_at_utc: "00:05"
+  run_at_utc: "00:05"          # HH:MM, timezone'daki yerel saat (borsa verisinin oturması için mum kapanışından sonra)
+  timezone: ""                 # IANA bölge adı, örn. "Europe/Rome"; boşsa UTC (DST'yi otomatik takip eder, sabit ofset değil)
 
 telegram:
   enabled: true

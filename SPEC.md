@@ -823,7 +823,10 @@ Varsayılan maliyetler (konfigürasyondan gelir, sıfır olamaz):
 ### 6.7 engine — günlük döngü
 
 ```
-1.  saat kontrolü: UTC 00:05 (mum kapanışından 5 dk sonra, borsa verisi otursun)
+1.  saat kontrolü: execution.run_at_utc, execution.timezone'da yorumlanan yerel saat
+    (varsayılan UTC 00:05, mum kapanışından 5 dk sonra, borsa verisi otursun) — timezone
+    boş değilse gerçek bir IANA bölgesi (örn. "Europe/Rome") kullanılır, sabit bir UTC
+    ofseti değil, böylece DST geçişlerinde saat kaymaz
 2.  datafeed.Update()                      → yeni mumlar
 3.  datafeed.Verify()                      → kalite; başarısızsa dur + bildir
 4.  broker.Portfolio()                     → güncel durum
@@ -1056,7 +1059,8 @@ costs:                           # İ4: zorunlu, sıfır olamaz
 execution:
   order_type: market
   approval_ttl_hours: 4
-  run_at_utc: "00:05"
+  run_at_utc: "00:05"           # HH:MM, timezone'daki yerel saat
+  timezone: ""                  # IANA bölge adı (örn. "Europe/Rome"); boşsa UTC
 
 telegram:
   enabled: true

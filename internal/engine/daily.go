@@ -90,8 +90,21 @@ type Config struct {
 	Timeframe string // e.g. "1d" — config.yaml data.timeframe
 	Quote     string // e.g. "USDT" — config.yaml exchange.quote; also the BTC benchmark's quote asset
 
-	ApprovalTTL  time.Duration // config.yaml execution.approval_ttl_hours; default 4h
-	RunAtUTC     string        // config.yaml execution.run_at_utc; default "00:05"
+	ApprovalTTL time.Duration // config.yaml execution.approval_ttl_hours; default 4h
+	// RunAt is "HH:MM" wall-clock time in Location — config.yaml
+	// execution.run_at_utc; default "00:05". The field kept its original
+	// name in config.yaml/config.go for backward compatibility with
+	// deployed config.yaml files; only its interpretation changed (a fixed
+	// UTC instant is just the Location==time.UTC special case).
+	RunAt string
+	// Location is config.yaml execution.timezone (an IANA zone name, e.g.
+	// "Europe/Rome"), resolved by the caller (cmd/swingbot/paper.go) via
+	// time.LoadLocation; nil defaults to time.UTC below, matching every
+	// deployment before this field existed. Using a real *time.Location
+	// rather than a fixed offset is what lets RunAt track that zone's own
+	// DST transitions automatically instead of drifting an hour twice a
+	// year the way a hardcoded UTC offset would.
+	Location     *time.Location
 	PollInterval time.Duration // how often the approval wait re-checks Approvals(); default 30s
 
 	// Clock drives scheduling (when to run) and the approval-wait poll
@@ -110,8 +123,11 @@ func (c Config) withDefaults() Config {
 	if c.ApprovalTTL <= 0 {
 		c.ApprovalTTL = 4 * time.Hour
 	}
-	if c.RunAtUTC == "" {
-		c.RunAtUTC = "00:05"
+	if c.RunAt == "" {
+		c.RunAt = "00:05"
+	}
+	if c.Location == nil {
+		c.Location = time.UTC
 	}
 	if c.PollInterval <= 0 {
 		c.PollInterval = 30 * time.Second
